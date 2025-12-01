@@ -161,47 +161,44 @@ class TradingBot:
         # Step 5: Load initial historical data
         self.logger.info("\n[5/6] Loading initial historical data...")
         
+        # Create a single loader instance
+        loader = InitialCandlesLoader(
+            app_config=self.app_config,
+            rest_client=self.rest_client
+        )
+        
         for symbol_cfg in enabled_symbols:
             symbol = symbol_cfg.name
-            symbol_logger = get_symbol_logger(symbol)
             
-            for tf_cfg in symbol_cfg.timeframes:
-                tf = tf_cfg.tf
-                key = (symbol, tf)
+            try:
+                self.logger.info(f"Loading historical data for {symbol}...")
                 
-                try:
-                    self.logger.info(f"Loading {symbol} {tf}...")
+                # Build dicts of managers/syncs for this symbol (keyed by timeframe string)
+                symbol_candle_managers = {}
+                symbol_candle_syncs = {}
+                
+                for tf_cfg in symbol_cfg.timeframes:
+                    tf = tf_cfg.tf
+                    key = (symbol, tf)
+                    symbol_candle_managers[tf] = self.candle_managers[key]
+                    symbol_candle_syncs[tf] = self.candle_syncs[key]
+                
+                # Load all timeframes for this symbol in one call
+                success = loader.load_initial_for_symbol(
+                    symbol_cfg=symbol_cfg,
+                    candle_managers=symbol_candle_managers,
+                    candle_syncs=symbol_candle_syncs,
+                    liquidity_maps=None  # No liquidity maps for now
+                )
+                
+                if success:
+                    self.logger.info(f"✓ Successfully loaded all timeframes for {symbol}")
+                else:
+                    self.logger.warning(f"Failed to load some timeframes for {symbol}")
                     
-                    # Use InitialCandlesLoader to fetch historical data
-                    loader = InitialCandlesLoader(
-                        rest_client=self.rest_client,
-                        logger=symbol_logger
-                    )
-                    
-                    # Load initial candles
-                    candles = loader.load(
-                        symbol=symbol,
-                        timeframe=tf,
-                        lookback_candles=tf_cfg.fetch
-                    )
-                    
-                    if candles:
-                        # Store candles using load_initial method
-                        candle_manager = self.candle_managers[key]
-                        candle_manager.load_initial(candles)
-                        
-                        # Set the last timestamp in CandleSync
-                        candle_sync = self.candle_syncs[key]
-                        if candles:
-                            candle_sync.set_initial_last_ts(candles[-1]['ts'])
-                        
-                        self.logger.info(f"✓ Loaded {len(candles)} candles for {symbol} {tf}")
-                    else:
-                        self.logger.warning(f"No candles loaded for {symbol} {tf}")
-                        
-                except Exception as e:
-                    self.logger.error(f"Failed to load {symbol} {tf}: {e}")
-                    continue
+            except Exception as e:
+                self.logger.error(f"Failed to load {symbol}: {e}")
+                continue
         
         # Step 6: Setup WebSocket
         self.logger.info("\n[6/6] Setting up WebSocket client...")
