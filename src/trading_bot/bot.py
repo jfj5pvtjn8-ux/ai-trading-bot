@@ -221,7 +221,7 @@ class TradingBot:
                                 # Pass to CandleSync for validation
                                 candle_sync = self.candle_syncs.get(k)
                                 if candle_sync:
-                                    candle_sync.on_websocket_candle(candle)
+                                    candle_sync.on_ws_closed_candle(candle)
                                 else:
                                     self.logger.warning(f"No CandleSync for {s} {t}")
                             except Exception as e:
