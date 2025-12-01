@@ -1,0 +1,64 @@
+# Symbols configuration for the trading bot
+# - Set `enabled: true` to activate a symbol
+# - `timeframes` is a list of timeframe objects with `tf` and `fetch` (number of candles to fetch)
+#
+# Fetch sizes with automatic pagination support:
+#   1m:  3000 candles = ~50 hours / 2.1 days (3 API requests)
+#   5m:  1500 candles = ~5.2 days (2 API requests)
+#   15m: 800 candles  = ~8.3 days (1 API request)
+#   1h:  400 candles  = ~16.6 days (1 API request)
+#
+# RestClient automatically handles pagination for values > 1000 candles per request
+
+symbols:
+  - name: "BTCUSDT"
+    enabled: true
+    timeframes:
+      - tf: "1m"
+        fetch: 3000
+      - tf: "5m"
+        fetch: 1500
+      - tf: "15m"
+        fetch: 800
+      - tf: "1h"
+        fetch: 400
+      
+
+  - name: "ETHUSDT"
+    enabled: false      # start disabled — turn on later
+    timeframes:
+      - tf: "1m"
+        fetch: 3000
+      - tf: "5m"
+        fetch: 1500
+      - tf: "15m"
+        fetch: 800
+      - tf: "1h"
+        fetch: 400
+      
+
+  - name: "SOLUSDT"
+    enabled: false
+    timeframes:
+      - tf: "1m"
+        fetch: 3000
+      - tf: "5m"
+        fetch: 1500
+      - tf: "15m"
+        fetch: 800
+      - tf: "1h"
+        fetch: 400
+      
+
+  - name: "XRPUSDT"
+    enabled: true
+    timeframes:
+      - tf: "1m"
+        fetch: 3000
+      - tf: "5m"
+        fetch: 1500
+      - tf: "15m"
+        fetch: 800
+      - tf: "1h"
+        fetch: 400
+      
