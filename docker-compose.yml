@@ -1,0 +1,16 @@
+services:
+  trading_bot:
+    build: .
+    container_name: trading_bot
+    restart: unless-stopped
+    ports:
+      - "8080:8080"                       # Health check endpoint
+    volumes:
+      - ./config:/app/config:ro          # Config files (read-only)
+      - ./data:/app/data                 # Data storage (persistent)
+      - ./logs:/app/logs                 # Log files (persistent)
+    env_file:
+      - .env                              # Load environment variables
+    environment:
+      - TZ=UTC
+      - PYTHONUNBUFFERED=1                # For real-time log output

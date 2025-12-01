@@ -1,0 +1,23 @@
+app:
+  name: "AI Trading Bot"
+  log_level: "INFO"
+  
+timeframe_intervals:
+  "1m": 60
+  "3m": 180
+  "5m": 300
+  "15m": 900
+  "30m": 1800
+  "1h": 3600
+  
+
+candles:
+  max_size: 600
+  initial_retries: 3
+  retry_delay: 0.5
+
+exchange:
+  name: "binance"
+  rest_endpoint: "https://api.binance.com/api/v3/klines"
+  ws_endpoint: "wss://stream.binance.com:9443"
+  request_timeout: 30
