@@ -5,13 +5,12 @@ from trading_bot.config.app.models import AppConfig
 
 class CandleSync:
     """
-    Ensures that incoming closed candles are:
-    - Strictly sequential in timestamp
-    - Missing gaps are filled via REST
-    - No duplicates
-    - Delivered to CandleManager + MultiTFSymbolManager correctly
-
-    WS → CandleSync → (validated) → CandleManager → LiquidityMap → Fusion → Decision Engine
+    Ensures closed candles are:
+      - Sequential
+      - Gap-filled when needed
+      - Using OPEN TIMESTAMPS (t divisible by timeframe)
+      - Synchronized across TFs
+      - Forwarded to CandleManager + Strategy Layer
     """
 
     def __init__(
@@ -23,135 +22,141 @@ class CandleSync:
         app_config: AppConfig,
     ):
         self.logger = get_logger(__name__)
+
         self.rest = rest_client
         self.symbol = symbol
         self.tf = timeframe
         self.cm = candle_manager
         self.app_config = app_config
-        self.step = app_config.get_timeframe_seconds(timeframe)
 
-        self.last_closed_ts: Optional[int] = None
-        self.callback: Optional[Callable[[str, Dict[str, Any]], Any]] = None
+        # timeframe step in seconds
+        self.step = self.app_config.get_timeframe_seconds(timeframe)
 
-    # ---------------------------------------------------------
-    # SETTERS
-    # ---------------------------------------------------------
-    def set_initial_last_ts(self, ts: Optional[int]):
-        """Set last known candle during initial load."""
-        self.last_closed_ts = ts
-        self.logger.info(
-            f"[CandleSync] {self.symbol} {self.tf} initial last_ts={ts}"
-        )
+        # We store OPEN timestamp, not CLOSE timestamp.
+        self.last_open_ts: Optional[int] = None
 
-    def set_callback(self, fn: Callable[[str, Dict[str, Any]], Any]):
-        """Callback to MultiTFSymbolManager.on_valid_candle(tf, candle)."""
+        # callback(symbol, timeframe, candle)
+        self.callback: Optional[Callable[[str, str, Dict[str, Any]], Any]] = None
+
+    # -------------------------------------------------------------------------
+    # SETUP
+    # -------------------------------------------------------------------------
+
+    def set_initial_last_ts(self, last_ts: Optional[int]):
+        """Set the last known open timestamp from initial REST load."""
+        self.last_open_ts = last_ts
+        self.logger.info(f"[CandleSync] Seed ts={last_ts} for {self.symbol} {self.tf}")
+
+    def set_callback(self, fn: Callable[[str, str, Dict[str, Any]], Any]):
         self.callback = fn
 
-    # ---------------------------------------------------------
-    # MAIN ENTRY: CLOSED CANDLE FROM WEBSOCKET
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # ENTRY: CLOSED CANDLE FROM WEBSOCKET
+    # -------------------------------------------------------------------------
+
     def on_ws_closed_candle(self, candle: Dict[str, Any], storage=None):
         """
-        Handles incoming closed candles from WS stream:
-        - validates timestamp order
-        - fetches missing candles
-        - pushes valid candles to CandleManager
-        - notifies callback
-        - saves to Parquet storage if provided
+        WS candle dict MUST contain:
+            {"open_ts": int, ...}
+        Not close timestamp!
         """
-        incoming_ts = candle["ts"]
 
-        # Case 1: First candle ever
-        if self.last_closed_ts is None:
+        incoming_open_ts = candle["open_ts"]
+
+        # First candle ever
+        if self.last_open_ts is None:
             self._accept(candle, storage)
             return
 
-        expected_ts = self.last_closed_ts + self.step
+        expected = self.last_open_ts + self.step
 
-        # Case 2: Duplicate or old candle
-        if incoming_ts <= self.last_closed_ts:
-            self.logger.debug(
-                f"[CandleSync] Skip duplicate/out-of-order: {self.symbol} {self.tf} incoming_ts={incoming_ts}"
-            )
+        # Duplicate / old
+        if incoming_open_ts <= self.last_open_ts:
             return
 
-        # Case 3: Exact next candle → perfect
-        if incoming_ts == expected_ts:
+        # Perfect next candle
+        if incoming_open_ts == expected:
             self._accept(candle, storage)
             return
 
-        # Case 4: Missing candles detected → fetch from REST
-        if incoming_ts > expected_ts:
-            self._fill_missing(expected_ts, incoming_ts)
+        # Missing gaps — fetch via REST
+        if incoming_open_ts > expected:
+            self._fill_missing(expected, incoming_open_ts)
             self._accept(candle, storage)
             return
 
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
     # ACCEPT VALID CANDLE
-    # ---------------------------------------------------------
-    def _accept(self, candle: Dict[str, Any], storage=None):
-        """Accept a validated closed candle, push to CandleManager, call callback."""
+    # -------------------------------------------------------------------------
 
+    def _accept(self, candle: Dict[str, Any], storage=None):
         self.cm.add_closed_candle(candle)
-        self.last_closed_ts = candle["ts"]
-        
-        # Save to Parquet storage asynchronously
+        self.last_open_ts = candle["open_ts"]
+
         if storage:
             storage.save_candle_async(self.symbol, self.tf, candle)
 
-        self.logger.info(
-            f"[CandleSync] ACCEPTED {self.symbol} {self.tf} ts={candle['ts']} close={candle['close']}"
-        )
-
-        # Notify the MultiTFSymbolManager that a valid closed candle is ready
         if self.callback:
-            self.callback(self.tf, candle)
+            try:
+                self.callback(self.symbol, self.tf, candle)
+            except Exception as e:
+                self.logger.error(f"Candle callback error {self.symbol} {self.tf}: {e}")
 
-    # ---------------------------------------------------------
-    # MISSING CANDLES HANDLING (REST BACKFILL)
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # GAP FILLING
+    # -------------------------------------------------------------------------
+
     def _fill_missing(self, start_ts: int, incoming_ts: int):
         """
-        If the expected timestamp is less than the incoming timestamp,
-        it means we missed one or more WS candles.
+        If we expected ts=X but WS gives ts=Y, fetch missing candles:
+        X, X+step, X+2step ... until Y-step.
         """
         self.logger.warning(
             f"[CandleSync] Missing candles for {self.symbol} {self.tf} "
-            f"expected from {start_ts} to {incoming_ts - self.step}"
+            f"from {start_ts} to {incoming_ts - self.step}"
         )
 
-        cur_ts = start_ts
+        ts = start_ts
 
-        while cur_ts < incoming_ts:
-            # Fetch exact candle by timestamp
-            missing_candle = self.rest.fetch_kline_exact(
-                self.symbol, self.tf, cur_ts
-            )
+        while ts < incoming_ts:
+            missing = self._fetch_exact_open_candle(ts)
 
-            if not missing_candle:
-                # If exact match fails, try smaller window fetch
-                self.logger.warning(
-                    f"[CandleSync] Could not fetch exact candle ts={cur_ts}. "
-                    f"Trying fallback batch..."
+            if not missing:
+                self.logger.error(
+                    f"[CandleSync] Could not recover missing candle @ {ts}"
                 )
-                batch = self.rest.fetch_klines(
-                    self.symbol, self.tf, limit=10
-                )
-                matched = next(
-                    (x for x in batch if x["ts"] == cur_ts), None
-                )
+                ts += self.step
+                continue
 
-                if matched:
-                    missing_candle = matched
-                else:
-                    self.logger.error(
-                        f"[CandleSync] Missing candle ts={cur_ts} NOT RECOVERED."
-                    )
-                    break  # avoid infinite loop
+            self._accept(missing)
+            ts += self.step
 
-            self.logger.info(
-                f"[CandleSync] RECOVERED missing candle ts={cur_ts}"
-            )
-            self._accept(missing_candle)
+    # -------------------------------------------------------------------------
+    # REST HELPERS
+    # -------------------------------------------------------------------------
 
-            cur_ts += self.step
+    def _fetch_exact_open_candle(self, open_ts: int) -> Optional[Dict[str, Any]]:
+        """
+        Fetch EXACT candle matching open timestamp.
+
+        - Start time = open_ts * 1000
+        - End time   = (open_ts + step) * 1000
+        """
+
+        batch = self.rest.fetch_klines(
+            symbol=self.symbol,
+            timeframe=self.tf,
+            limit=2,
+            start_time=open_ts * 1000,
+            end_time=(open_ts + self.step) * 1000,
+        )
+
+        if not batch:
+            return None
+
+        # Find candle by open timestamp match
+        for c in batch:
+            if c["open_ts"] == open_ts:
+                return c
+
+        return None

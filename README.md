@@ -132,7 +132,7 @@ Logs written to:
 
 ```bash
 # Validate Parquet files
-python validate_parquet.py
+python src/trading_bot/utils/validate_parquet.py
 
 # Check WebSocket connection
 curl http://localhost:8080/health | jq '.websocket'
