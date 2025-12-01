@@ -187,7 +187,7 @@ class TradingBot:
                     candles = loader.load(
                         symbol=symbol,
                         timeframe=tf,
-                        lookback_candles=tf_cfg.lookback_candles
+                        lookback_candles=tf_cfg.fetch
                     )
                     
                     if candles:
