@@ -19,6 +19,7 @@ from typing import Dict, List
 from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, jsonify
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from trading_bot.config.app import load_app_config
 from trading_bot.config.symbols import load_symbols_config
 from trading_bot.api import RestClient, WebSocketClient
@@ -158,8 +159,8 @@ class TradingBot:
             self.logger.error("No candle managers created!")
             return False
         
-        # Step 5: Load initial historical data
-        self.logger.info("\n[5/6] Loading initial historical data...")
+        # Step 5: Load initial historical data (async parallel loading)
+        self.logger.info("\n[5/6] Loading initial historical data (parallel)...")
         
         # Create a single loader instance
         loader = InitialCandlesLoader(
@@ -167,11 +168,12 @@ class TradingBot:
             rest_client=self.rest_client
         )
         
-        for symbol_cfg in enabled_symbols:
-            symbol = symbol_cfg.name
+        # Load symbols in parallel using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(enabled_symbols), thread_name_prefix="candle_loader") as executor:
+            futures = {}
             
-            try:
-                self.logger.info(f"Loading historical data for {symbol}...")
+            for symbol_cfg in enabled_symbols:
+                symbol = symbol_cfg.name
                 
                 # Build dicts of managers/syncs for this symbol (keyed by timeframe string)
                 symbol_candle_managers = {}
@@ -183,22 +185,29 @@ class TradingBot:
                     symbol_candle_managers[tf] = self.candle_managers[key]
                     symbol_candle_syncs[tf] = self.candle_syncs[key]
                 
-                # Load all timeframes for this symbol in one call
-                success = loader.load_initial_for_symbol(
+                # Submit symbol loading to thread pool
+                future = executor.submit(
+                    loader.load_initial_for_symbol,
                     symbol_cfg=symbol_cfg,
                     candle_managers=symbol_candle_managers,
                     candle_syncs=symbol_candle_syncs,
-                    liquidity_maps=None  # No liquidity maps for now
+                    liquidity_maps=None,
+                    storage=self.storage  # Enable async Parquet storage
                 )
-                
-                if success:
-                    self.logger.info(f"✓ Successfully loaded all timeframes for {symbol}")
-                else:
-                    self.logger.warning(f"Failed to load some timeframes for {symbol}")
-                    
-            except Exception as e:
-                self.logger.error(f"Failed to load {symbol}: {e}")
-                continue
+                futures[future] = symbol
+                self.logger.info(f"Submitted {symbol} for parallel loading...")
+            
+            # Wait for all symbols to complete
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    success = future.result()
+                    if success:
+                        self.logger.info(f"✓ Successfully loaded all timeframes for {symbol}")
+                    else:
+                        self.logger.warning(f"Failed to load some timeframes for {symbol}")
+                except Exception as e:
+                    self.logger.error(f"Failed to load {symbol}: {e}")
         
         # Step 6: Setup WebSocket
         self.logger.info("\n[6/6] Setting up WebSocket client...")
@@ -213,25 +222,24 @@ class TradingBot:
                     tf = tf_cfg.tf
                     key = (symbol, tf)
                     
-                    # Create closure to capture symbol and timeframe
-                    def make_callback(s, t, k):
-                        def callback(candle):
+                    # Create callback for this symbol/timeframe
+                    def make_callback(k):
+                        def callback(symbol, timeframe, candle):
                             """Handle WebSocket closed candle."""
                             try:
-                                # Pass to CandleSync for validation
                                 candle_sync = self.candle_syncs.get(k)
                                 if candle_sync:
-                                    candle_sync.on_ws_closed_candle(candle)
+                                    candle_sync.on_ws_closed_candle(candle, storage=self.storage)
                                 else:
-                                    self.logger.warning(f"No CandleSync for {s} {t}")
+                                    self.logger.warning(f"No CandleSync for {symbol} {timeframe}")
                             except Exception as e:
-                                self.logger.error(f"Error processing WS candle {s} {t}: {e}")
+                                self.logger.error(f"Error processing WS candle {symbol} {timeframe}: {e}")
                         return callback
                     
                     self.ws_client.subscribe(
                         symbol=symbol,
                         timeframe=tf,
-                        callback=make_callback(symbol, tf, key)
+                        callback=make_callback(key)
                     )
                     
                     self.logger.info(f"✓ Subscribed to {symbol} {tf}")

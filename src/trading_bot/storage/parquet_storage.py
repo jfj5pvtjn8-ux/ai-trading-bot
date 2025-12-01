@@ -128,13 +128,21 @@ class ParquetStorage:
         except Exception as e:
             self.logger.error(f"[ParquetStorage] Failed to save candle: {e}")
     
+    def save_candle_async(self, symbol: str, timeframe: str, candle: Dict[str, Any]):
+        """Submit candle save to thread pool (non-blocking)."""
+        self.executor.submit(self.save_candle, symbol, timeframe, candle)
+    
     def save_candles_batch(self, symbol: str, timeframe: str, candles: List[Dict[str, Any]]) -> None:
         """Save multiple candles in a batch (used for initial load)."""
         if not candles:
             return
         
         try:
+            # Check if date has changed (midnight rollover)
             current_date = datetime.now().strftime("%Y-%m-%d")
+            if current_date != self.current_date:
+                self._rotate_to_new_date(current_date)
+            
             file_lock = self._get_file_lock(symbol, timeframe, current_date)
             
             with file_lock:
@@ -168,6 +176,10 @@ class ParquetStorage:
                 
         except Exception as e:
             self.logger.error(f"[ParquetStorage] Failed to batch save candles: {e}")
+    
+    def save_candles_batch_async(self, symbol: str, timeframe: str, candles: List[Dict[str, Any]]):
+        """Submit batch save to thread pool (non-blocking)."""
+        self.executor.submit(self.save_candles_batch, symbol, timeframe, candles)
     
     def _rotate_to_new_date(self, new_date: str):
         """Archive yesterday's files and prepare for new date."""

@@ -34,7 +34,8 @@ class InitialCandlesLoader:
         symbol_cfg: SymbolConfig,
         candle_managers: Dict[str, Any],    # {"1m": CandleManager, ...}
         candle_syncs: Dict[str, Any],       # {"1m": CandleSync, ...}
-        liquidity_maps: Dict[str, Any] = None  # Dict of LiquidityMap per TF
+        liquidity_maps: Dict[str, Any] = None,  # Dict of LiquidityMap per TF
+        storage = None  # ParquetStorage for async writes
     ) -> bool:
         """
         Loads and seeds all structures for a single symbol.
@@ -72,6 +73,11 @@ class InitialCandlesLoader:
             # 3️⃣ Set last closed timestamp for CandleSync
             last_ts = cm.last_timestamp()
             sync.set_initial_last_ts(last_ts)
+            
+            # 4️⃣ Save to Parquet storage (async)
+            if storage:
+                storage.save_candles_batch_async(symbol, tf, candles)
+                self.logger.debug(f"[InitialLoad] Submitted {len(candles)} candles to storage for {symbol} {tf}")
 
             # 4️⃣ Build initial LiquidityMap for this timeframe
             if liquidity_maps is not None and tf in liquidity_maps:

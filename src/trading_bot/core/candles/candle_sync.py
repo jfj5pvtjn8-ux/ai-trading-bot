@@ -50,19 +50,20 @@ class CandleSync:
     # ---------------------------------------------------------
     # MAIN ENTRY: CLOSED CANDLE FROM WEBSOCKET
     # ---------------------------------------------------------
-    def on_ws_closed_candle(self, candle: Dict[str, Any]):
+    def on_ws_closed_candle(self, candle: Dict[str, Any], storage=None):
         """
         Handles incoming closed candles from WS stream:
         - validates timestamp order
         - fetches missing candles
         - pushes valid candles to CandleManager
         - notifies callback
+        - saves to Parquet storage if provided
         """
         incoming_ts = candle["ts"]
 
         # Case 1: First candle ever
         if self.last_closed_ts is None:
-            self._accept(candle)
+            self._accept(candle, storage)
             return
 
         expected_ts = self.last_closed_ts + self.step
@@ -76,23 +77,27 @@ class CandleSync:
 
         # Case 3: Exact next candle → perfect
         if incoming_ts == expected_ts:
-            self._accept(candle)
+            self._accept(candle, storage)
             return
 
         # Case 4: Missing candles detected → fetch from REST
         if incoming_ts > expected_ts:
             self._fill_missing(expected_ts, incoming_ts)
-            self._accept(candle)
+            self._accept(candle, storage)
             return
 
     # ---------------------------------------------------------
     # ACCEPT VALID CANDLE
     # ---------------------------------------------------------
-    def _accept(self, candle: Dict[str, Any]):
+    def _accept(self, candle: Dict[str, Any], storage=None):
         """Accept a validated closed candle, push to CandleManager, call callback."""
 
         self.cm.add_closed_candle(candle)
         self.last_closed_ts = candle["ts"]
+        
+        # Save to Parquet storage asynchronously
+        if storage:
+            storage.save_candle_async(self.symbol, self.tf, candle)
 
         self.logger.info(
             f"[CandleSync] ACCEPTED {self.symbol} {self.tf} ts={candle['ts']} close={candle['close']}"

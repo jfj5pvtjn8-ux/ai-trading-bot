@@ -31,6 +31,10 @@ wheels/
 logs/
 *.log
 
+# Data files (Parquet storage)
+data/
+*.parquet
+
 # IDE
 .vscode/
 .idea/
