@@ -134,22 +134,17 @@ class TradingBot:
                 key = (symbol, tf)
                 
                 try:
-                    # Create CandleManager for storage
-                    candle_manager = CandleManager(
-                        symbol=symbol,
-                        timeframe=tf,
-                        storage=self.storage,
-                        logger=symbol_logger
-                    )
+                    # Create CandleManager for storage (only needs max_size)
+                    candle_manager = CandleManager(max_size=tf_cfg.fetch)
                     self.candle_managers[key] = candle_manager
                     
                     # Create CandleSync for validation
                     candle_sync = CandleSync(
+                        rest_client=self.rest_client,
                         symbol=symbol,
                         timeframe=tf,
                         candle_manager=candle_manager,
-                        rest_client=self.rest_client,
-                        logger=symbol_logger
+                        app_config=self.app_config
                     )
                     self.candle_syncs[key] = candle_sync
                     
@@ -191,10 +186,14 @@ class TradingBot:
                     )
                     
                     if candles:
-                        # Store candles
+                        # Store candles using load_initial method
                         candle_manager = self.candle_managers[key]
-                        for candle in candles:
-                            candle_manager.add_candle(candle)
+                        candle_manager.load_initial(candles)
+                        
+                        # Set the last timestamp in CandleSync
+                        candle_sync = self.candle_syncs[key]
+                        if candles:
+                            candle_sync.set_initial_last_ts(candles[-1]['ts'])
                         
                         self.logger.info(f"✓ Loaded {len(candles)} candles for {symbol} {tf}")
                     else:
@@ -270,12 +269,12 @@ class TradingBot:
                     if symbol not in symbols_status:
                         symbols_status[symbol] = {"timeframes": {}}
                     
-                    candle_count = candle_manager.get_candle_count()
-                    last_candle = candle_manager.get_latest_candle()
+                    candle_count = len(candle_manager.get_all())
+                    last_ts = candle_manager.last_timestamp()
                     
                     symbols_status[symbol]["timeframes"][tf] = {
                         "candles": candle_count,
-                        "last_timestamp": last_candle['ts'] if last_candle else None
+                        "last_timestamp": last_ts
                     }
                 
                 return jsonify({
@@ -296,13 +295,13 @@ class TradingBot:
                     if symbol not in stats_data:
                         stats_data[symbol] = {"timeframes": {}}
                     
-                    candles = candle_manager.get_recent_candles(count=100)
+                    recent_candles = candle_manager.last_n(100)
                     last_candle = candle_manager.get_latest_candle()
                     
                     stats_data[symbol]["timeframes"][tf] = {
-                        "total_candles": candle_manager.get_candle_count(),
+                        "total_candles": len(candle_manager.get_all()),
                         "last_candle": last_candle,
-                        "recent_candles_count": len(candles)
+                        "recent_candles_count": len(recent_candles)
                     }
                 
                 return jsonify({
@@ -389,7 +388,7 @@ class TradingBot:
             if symbol not in symbols_data:
                 symbols_data[symbol] = {}
             
-            candle_count = candle_manager.get_candle_count()
+            candle_count = len(candle_manager.get_all())
             last_candle = candle_manager.get_latest_candle()
             
             symbols_data[symbol][tf] = {
