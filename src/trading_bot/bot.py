@@ -4,7 +4,7 @@ Complete Integration Example: Full Trading Bot Flow
 This demonstrates the complete data flow from configuration to real-time candle processing:
 1. Load configurations (app + symbols)
 2. Create REST and WebSocket clients
-3. Create MultiTFSymbolManager for each enabled symbol
+3. Create CandleManager for each symbol/timeframe
 4. Load initial historical data
 5. Start WebSocket for real-time updates
 6. Process candles through validation pipeline
@@ -15,15 +15,17 @@ import time
 import signal
 import sys
 import threading
-from typing import Dict
+from typing import Dict, List
 from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, jsonify
 from trading_bot.config.app import load_app_config
 from trading_bot.config.symbols import load_symbols_config
 from trading_bot.api import RestClient, WebSocketClient
-from trading_bot.core.mtf_symbol_manager import MultiTFSymbolManager
-from trading_bot.core.logger import get_logger
+from trading_bot.core.candles.candle_manager import CandleManager
+from trading_bot.core.candles.candle_sync import CandleSync
+from trading_bot.core.candles.initial_candles_loader import InitialCandlesLoader
+from trading_bot.core.logger import get_logger, get_symbol_logger
 from trading_bot.storage import ParquetStorage
 
 
@@ -52,8 +54,11 @@ class TradingBot:
         # Storage
         self.storage = None
         
-        # Symbol managers
-        self.mtf_managers: Dict[str, MultiTFSymbolManager] = {}
+        # Candle managers: {(symbol, tf): CandleManager}
+        self.candle_managers: Dict[tuple, CandleManager] = {}
+        
+        # Candle sync managers: {(symbol, tf): CandleSync}
+        self.candle_syncs: Dict[tuple, CandleSync] = {}
         
         # Health endpoint
         self.health_app = None
@@ -116,69 +121,88 @@ class TradingBot:
             self.logger.error(f"Failed to create REST client: {e}")
             return False
         
-        # Step 4: Create MTF managers for each enabled symbol
-        self.logger.info("\n[4/6] Creating Multi-Timeframe Symbol Managers...")
+        # Step 4: Create candle managers for each enabled symbol/timeframe
+        self.logger.info("\n[4/6] Creating Candle Managers...")
         enabled_symbols = [s for s in self.symbols_config.symbols if s.enabled]
         
         for symbol_cfg in enabled_symbols:
-            try:
-                mtf_manager = MultiTFSymbolManager(
-                    symbol_cfg=symbol_cfg,
-                    app_config=self.app_config,
-                    rest_client=self.rest_client,
-                    storage=self.storage
-                )
+            symbol = symbol_cfg.name
+            symbol_logger = get_symbol_logger(symbol)
+            
+            for tf_cfg in symbol_cfg.timeframes:
+                tf = tf_cfg.tf
+                key = (symbol, tf)
                 
-                # Register callback for validated candles
-                mtf_manager.set_on_candle_callback(self._on_validated_candle)
-                
-                self.mtf_managers[symbol_cfg.name] = mtf_manager
-                
-                self.logger.info(f"✓ Created MTF manager for {symbol_cfg.name}")
-                
-            except Exception as e:
-                self.logger.error(f"Failed to create MTF manager for {symbol_cfg.name}: {e}")
-                continue
+                try:
+                    # Create CandleManager for storage
+                    candle_manager = CandleManager(
+                        symbol=symbol,
+                        timeframe=tf,
+                        storage=self.storage,
+                        logger=symbol_logger
+                    )
+                    self.candle_managers[key] = candle_manager
+                    
+                    # Create CandleSync for validation
+                    candle_sync = CandleSync(
+                        symbol=symbol,
+                        timeframe=tf,
+                        candle_manager=candle_manager,
+                        rest_client=self.rest_client,
+                        logger=symbol_logger
+                    )
+                    self.candle_syncs[key] = candle_sync
+                    
+                    self.logger.info(f"✓ Created managers for {symbol} {tf}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Failed to create managers for {symbol} {tf}: {e}")
+                    continue
         
-        if not self.mtf_managers:
-            self.logger.error("No symbol managers created!")
+        if not self.candle_managers:
+            self.logger.error("No candle managers created!")
             return False
         
-        # Step 5: Load initial historical data (parallel loading for speed)
+        # Step 5: Load initial historical data
         self.logger.info("\n[5/6] Loading initial historical data...")
         
-        import asyncio
-        from concurrent.futures import ThreadPoolExecutor
-        
-        async def load_symbol_async(symbol: str, mtf_manager) -> tuple:
-            """Load a symbol in thread pool to avoid blocking."""
-            loop = asyncio.get_event_loop()
-            try:
-                self.logger.info(f"Loading data for {symbol}...")
-                success = await loop.run_in_executor(None, mtf_manager.load_initial_data)
-                return (symbol, success, mtf_manager)
-            except Exception as e:
-                self.logger.exception(f"Error loading data for {symbol}: {e}")
-                return (symbol, False, None)
-        
-        async def load_all_symbols():
-            """Load all symbols in parallel."""
-            tasks = [
-                load_symbol_async(symbol, mgr)
-                for symbol, mgr in self.mtf_managers.items()
-            ]
-            return await asyncio.gather(*tasks)
-        
-        # Run parallel loading
-        results = asyncio.run(load_all_symbols())
-        
-        # Process results
-        for symbol, success, mtf_manager in results:
-            if success and mtf_manager:
-                self.logger.info(f"✓ {symbol} initialized")
-                self.logger.info(mtf_manager.get_summary())
-            else:
-                self.logger.error(f"✗ {symbol} initialization failed")
+        for symbol_cfg in enabled_symbols:
+            symbol = symbol_cfg.name
+            symbol_logger = get_symbol_logger(symbol)
+            
+            for tf_cfg in symbol_cfg.timeframes:
+                tf = tf_cfg.tf
+                key = (symbol, tf)
+                
+                try:
+                    self.logger.info(f"Loading {symbol} {tf}...")
+                    
+                    # Use InitialCandlesLoader to fetch historical data
+                    loader = InitialCandlesLoader(
+                        rest_client=self.rest_client,
+                        logger=symbol_logger
+                    )
+                    
+                    # Load initial candles
+                    candles = loader.load(
+                        symbol=symbol,
+                        timeframe=tf,
+                        lookback_candles=tf_cfg.lookback_candles
+                    )
+                    
+                    if candles:
+                        # Store candles
+                        candle_manager = self.candle_managers[key]
+                        for candle in candles:
+                            candle_manager.add_candle(candle)
+                        
+                        self.logger.info(f"✓ Loaded {len(candles)} candles for {symbol} {tf}")
+                    else:
+                        self.logger.warning(f"No candles loaded for {symbol} {tf}")
+                        
+                except Exception as e:
+                    self.logger.error(f"Failed to load {symbol} {tf}: {e}")
+                    continue
         
         # Step 6: Setup WebSocket
         self.logger.info("\n[6/6] Setting up WebSocket client...")
@@ -188,22 +212,30 @@ class TradingBot:
             # Subscribe to all enabled symbols and timeframes
             for symbol_cfg in enabled_symbols:
                 symbol = symbol_cfg.name
-                mtf_manager = self.mtf_managers.get(symbol)
-                
-                if not mtf_manager:
-                    continue
                 
                 for tf_cfg in symbol_cfg.timeframes:
                     tf = tf_cfg.tf
+                    key = (symbol, tf)
                     
                     # Create closure to capture symbol and timeframe
-                    def make_callback(s, t):
-                        return lambda candle: self.mtf_managers[s].on_ws_candle(t, candle)
+                    def make_callback(s, t, k):
+                        def callback(candle):
+                            """Handle WebSocket closed candle."""
+                            try:
+                                # Pass to CandleSync for validation
+                                candle_sync = self.candle_syncs.get(k)
+                                if candle_sync:
+                                    candle_sync.on_websocket_candle(candle)
+                                else:
+                                    self.logger.warning(f"No CandleSync for {s} {t}")
+                            except Exception as e:
+                                self.logger.error(f"Error processing WS candle {s} {t}: {e}")
+                        return callback
                     
                     self.ws_client.subscribe(
                         symbol=symbol,
                         timeframe=tf,
-                        callback=make_callback(symbol, tf)
+                        callback=make_callback(symbol, tf, key)
                     )
                     
                     self.logger.info(f"✓ Subscribed to {symbol} {tf}")
@@ -233,23 +265,23 @@ class TradingBot:
                 """Health check endpoint."""
                 symbols_status = {}
                 
-                for symbol, mtf_manager in self.mtf_managers.items():
-                    status = mtf_manager.get_status()
-                    symbols_status[symbol] = {
-                        "initialized": status['is_initialized'],
-                        "timeframes": {
-                            tf: {
-                                "candles": tf_data['candle_count'],
-                                "last_update": tf_data['last_timestamp']
-                            }
-                            for tf, tf_data in status['timeframes'].items()
-                        }
+                # Group by symbol
+                for (symbol, tf), candle_manager in self.candle_managers.items():
+                    if symbol not in symbols_status:
+                        symbols_status[symbol] = {"timeframes": {}}
+                    
+                    candle_count = candle_manager.get_candle_count()
+                    last_candle = candle_manager.get_latest_candle()
+                    
+                    symbols_status[symbol]["timeframes"][tf] = {
+                        "candles": candle_count,
+                        "last_timestamp": last_candle['ts'] if last_candle else None
                     }
                 
                 return jsonify({
                     "status": "running" if self.is_running else "stopped",
                     "timestamp": datetime.now().isoformat(),
-                    "symbols": list(self.mtf_managers.keys()),
+                    "symbols": list(set(s for s, _ in self.candle_managers.keys())),
                     "symbols_detail": symbols_status,
                     "websocket": "connected" if self.ws_client and self.ws_client.is_running else "disconnected"
                 })
@@ -259,19 +291,19 @@ class TradingBot:
                 """Detailed statistics endpoint."""
                 stats_data = {}
                 
-                for symbol, mtf_manager in self.mtf_managers.items():
-                    stats_data[symbol] = {
-                        "summary": mtf_manager.get_summary(),
-                        "status": mtf_manager.get_status()
+                # Group by symbol
+                for (symbol, tf), candle_manager in self.candle_managers.items():
+                    if symbol not in stats_data:
+                        stats_data[symbol] = {"timeframes": {}}
+                    
+                    candles = candle_manager.get_recent_candles(count=100)
+                    last_candle = candle_manager.get_latest_candle()
+                    
+                    stats_data[symbol]["timeframes"][tf] = {
+                        "total_candles": candle_manager.get_candle_count(),
+                        "last_candle": last_candle,
+                        "recent_candles_count": len(candles)
                     }
-                    
-                    # Add liquidity map stats if available
-                    if mtf_manager.liquidity_map:
-                        stats_data[symbol]["liquidity_map"] = mtf_manager.liquidity_map.get_statistics()
-                    
-                    # Add trend fusion stats if available
-                    if mtf_manager.trend_fusion:
-                        stats_data[symbol]["trend_fusion"] = mtf_manager.trend_fusion.get_statistics()
                 
                 return jsonify({
                     "timestamp": datetime.now().isoformat(),
@@ -318,11 +350,8 @@ class TradingBot:
         """
         Callback when a validated candle is received.
         
-        This is where you would trigger your trading logic:
-        - Update liquidity maps
-        - Detect market structure changes (CHoCH, BOS)
-        - Identify trading opportunities
-        - Execute trades
+        This is where you would add trading logic in the future.
+        For now, just log the validated candle.
         """
         self.logger.info(
             f"[Validated] {symbol} {timeframe}: "
@@ -330,14 +359,9 @@ class TradingBot:
             f"volume={candle['volume']:.4f}"
         )
         
-        # Save validated candle to parquet
-        if self.storage:
-            self.storage.save_candle(symbol, timeframe, candle)
-        
-        # TODO: Add your trading logic here
-        # - Check liquidity maps
-        # - Detect order blocks
-        # - Identify fair value gaps
+        # TODO: Add your trading logic here when ready
+        # - Detect patterns
+        # - Identify trading opportunities
         # - Execute trades based on strategy
     
     def run(self):
@@ -359,15 +383,30 @@ class TradingBot:
         self.logger.info("Status Update")
         self.logger.info("─" * 70)
         
-        for symbol, mtf_manager in self.mtf_managers.items():
-            status = mtf_manager.get_status()
+        # Group by symbol
+        symbols_data = {}
+        for (symbol, tf), candle_manager in self.candle_managers.items():
+            if symbol not in symbols_data:
+                symbols_data[symbol] = {}
             
+            candle_count = candle_manager.get_candle_count()
+            last_candle = candle_manager.get_latest_candle()
+            
+            symbols_data[symbol][tf] = {
+                'candle_count': candle_count,
+                'last_candle': last_candle
+            }
+        
+        for symbol, tfs_data in symbols_data.items():
             self.logger.info(f"\n{symbol}:")
-            for tf, tf_status in status['timeframes'].items():
-                close_val = tf_status['latest_close'] if tf_status['latest_close'] else 0
+            for tf, data in tfs_data.items():
+                last_candle = data['last_candle']
+                close_val = last_candle['close'] if last_candle else 0
+                last_ts = last_candle['ts'] if last_candle else None
+                
                 self.logger.info(
-                    f"  {tf}: {tf_status['candle_count']} candles, "
-                    f"last_ts={tf_status['last_timestamp']}, "
+                    f"  {tf}: {data['candle_count']} candles, "
+                    f"last_ts={last_ts}, "
                     f"close=${close_val:.2f}"
                 )
     
@@ -387,12 +426,6 @@ class TradingBot:
             self.logger.info("Stopping WebSocket...")
             self.ws_client.stop()
             self.logger.info("✓ WebSocket stopped")
-        
-        # Shutdown all MTF managers
-        self.logger.info("Shutting down symbol managers...")
-        for symbol, mtf_manager in self.mtf_managers.items():
-            mtf_manager.shutdown()
-            self.logger.info(f"✓ {symbol} manager shutdown")
         
         # Close REST client
         if self.rest_client:
