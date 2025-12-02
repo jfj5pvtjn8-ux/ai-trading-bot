@@ -1,19 +1,25 @@
+#!/usr/bin/env python3
 """
-Trading Bot Orchestrator – WIRED CORRECTLY WITH FIXED CALLBACKS
+TradingBot PRO+ Edition
 
-This version contains:
-- Correct WebSocket callback handling (callback(candle) only)
-- Fixed closure capturing for (symbol, timeframe)
-- Proper CandleSync callback wiring: callback(symbol, timeframe, candle)
+Features
+--------
+✓ Full MTF orchestration
+✓ Proper wiring between REST → Loader → CandleManager → CandleSync → WS
+✓ Gap-safe, restart-safe, alignment-safe pipeline
+✓ Correct websocket callback closures (per-symbol, per-tf)
+✓ Storage-safe async writes
+✓ Health HTTP endpoint
+✓ Graceful SIGINT / SIGTERM shutdown
 """
 
 import os
+import sys
 import time
 import signal
-import sys
 import threading
-from typing import Dict, Tuple
 from datetime import datetime
+from typing import Dict, Tuple
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify
@@ -21,277 +27,278 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from trading_bot.config.app import load_app_config
 from trading_bot.config.symbols import load_symbols_config
+from trading_bot.core.logger import get_logger, get_symbol_logger
+
 from trading_bot.api.rest_client import RestClient
 from trading_bot.api.ws_client import WebSocketClient
+
 from trading_bot.core.candles.candle_manager import CandleManager
 from trading_bot.core.candles.candle_sync import CandleSync
 from trading_bot.core.candles.initial_candles_loader import InitialCandlesLoader
-from trading_bot.core.logger import get_logger, get_symbol_logger
+
 from trading_bot.storage.parquet_storage import ParquetStorage
 
 
 class TradingBot:
     """
-    Main orchestrator for multi-symbol, multi-timeframe trading engine.
+    PRO+ main orchestrator.
+    Manages:
+        - REST initial load
+        - CandleManager (memory window)
+        - CandleSync (RT validation)
+        - ParquetStorage async writes
+        - WS Client (stream handler)
+        - Health Endpoint
     """
 
     def __init__(self):
         load_dotenv()
         self.logger = get_logger(__name__)
 
-        # Runtime state
         self.is_running = False
+
+        # Loaded configs
         self.app_config = None
         self.symbols_config = None
-        self.rest_client: RestClient | None = None
-        self.ws_client: WebSocketClient | None = None
+
+        # Core subsystems
+        self.rest: RestClient | None = None
+        self.ws: WebSocketClient | None = None
         self.storage: ParquetStorage | None = None
 
-        # Structures
-        # key = (symbol, timeframe)
-        self.candle_managers: Dict[Tuple[str, str], CandleManager] = {}
-        self.candle_syncs: Dict[Tuple[str, str], CandleSync] = {}
+        # Per (symbol, timeframe)
+        self.cm: Dict[Tuple[str, str], CandleManager] = {}
+        self.sync: Dict[Tuple[str, str], CandleSync] = {}
 
-        # Health API
-        self.health_app: Flask | None = None
-        self.health_server_thread: threading.Thread | None = None
+        # Health API server thread
+        self.health_app = None
+        self.health_thread = None
         self.health_port = int(os.getenv("HEALTH_PORT", "8080"))
 
-        # Shutdown handling
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        # OS Signals
+        signal.signal(signal.SIGINT, self._shutdown_signal)
+        signal.signal(signal.SIGTERM, self._shutdown_signal)
 
-    # -------------------------------------------------------------------------
+    # ======================================================================
     # SIGNAL HANDLER
-    # -------------------------------------------------------------------------
+    # ======================================================================
 
-    def _signal_handler(self, signum, frame):
-        self.logger.info(f"Received signal {signum}, shutting down...")
+    def _shutdown_signal(self, signum, frame):
+        self.logger.info(f"[TradingBot] Received signal {signum}, shutting down...")
         self.stop()
         sys.exit(0)
 
-    # -------------------------------------------------------------------------
-    # INITIALIZATION
-    # -------------------------------------------------------------------------
+    # ======================================================================
+    # INITIALIZE
+    # ======================================================================
 
     def initialize(self) -> bool:
         self.logger.info("=" * 80)
-        self.logger.info("Initializing Trading Bot")
+        self.logger.info("TradingBot PRO+ – Initialization")
         self.logger.info("=" * 80)
 
-        # -------------------------------------------------
-        # Load configurations
-        # -------------------------------------------------
-        self.logger.info("[1/6] Loading configurations...")
+        # -------------------------------------------------------
+        # Load Configs
+        # -------------------------------------------------------
         try:
             config_dir = os.getenv("CONFIG_DIR", "config")
+
             self.app_config = load_app_config(f"{config_dir}/app.yml")
             self.symbols_config = load_symbols_config(f"{config_dir}/symbols.yml")
 
-            enabled_symbols = [s for s in self.symbols_config.symbols if s.enabled]
-
-            if not enabled_symbols:
+            enabled = [s for s in self.symbols_config.symbols if s.enabled]
+            if not enabled:
                 self.logger.error("No enabled symbols found.")
                 return False
 
-            self.logger.info(f"✓ App config loaded: {self.app_config.app.name}")
-            self.logger.info(f"✓ Symbols config loaded: {len(enabled_symbols)} enabled symbols")
-            for s in enabled_symbols:
-                tfs = [tf.tf for tf in s.timeframes]
-                self.logger.info(f"  - {s.name}: {tfs}")
+            self.logger.info(f"[Config] App loaded: {self.app_config.app.name}")
+            for s in enabled:
+                tfs = [t.tf for t in s.timeframes]
+                self.logger.info(f"[Config] {s.name}: {tfs}")
 
         except Exception as e:
-            self.logger.error(f"Config load error: {e}")
+            self.logger.error(f"[Config] Failed: {e}")
             return False
 
-        # -------------------------------------------------
-        # Init Parquet storage
-        # -------------------------------------------------
-        self.logger.info("\n[2/6] Initializing Parquet storage...")
+        # -------------------------------------------------------
+        # Parquet Storage
+        # -------------------------------------------------------
         try:
             self.storage = ParquetStorage(
                 base_path=os.getenv("DATA_DIR", "data/live"),
                 retention_days=int(os.getenv("PARQUET_RETENTION_DAYS", "7")),
+                fresh_start=False,
             )
-            self.logger.info("✓ Parquet storage initialized.")
+            self.logger.info("[Storage] ParquetStorage initialized.")
         except Exception as e:
-            self.logger.error(f"Parquet storage error: {e}")
+            self.logger.error(f"[Storage] Failed: {e}")
             return False
 
-        # -------------------------------------------------
-        # REST client
-        # -------------------------------------------------
-        self.logger.info("\n[3/6] Creating REST client...")
+        # -------------------------------------------------------
+        # REST Client
+        # -------------------------------------------------------
         try:
-            self.rest_client = RestClient(self.app_config)
-            self.logger.info(f"✓ REST client created: {self.app_config.exchange.rest_endpoint}")
+            self.rest = RestClient(self.app_config)
+            self.logger.info("[REST] RestClient initialized.")
         except Exception as e:
-            self.logger.error(f"REST client error: {e}")
+            self.logger.error(f"[REST] Failed: {e}")
             return False
 
-        # -------------------------------------------------
-        # Build CandleManager + CandleSync for each TF
-        # -------------------------------------------------
-        self.logger.info("\n[4/6] Creating Candle Managers & Syncs...")
-        enabled_symbols = [s for s in self.symbols_config.symbols if s.enabled]
+        # -------------------------------------------------------
+        # Create CandleManager + CandleSync
+        # -------------------------------------------------------
+        for s in enabled:
+            sym = s.name
+            get_symbol_logger(sym)
 
-        for sym_cfg in enabled_symbols:
-            symbol = sym_cfg.name
-            get_symbol_logger(symbol)
-
-            for tf_cfg in sym_cfg.timeframes:
+            for tf_cfg in s.timeframes:
                 tf = tf_cfg.tf
-                key = (symbol, tf)
+                key = (sym, tf)
 
                 try:
-                    cm = CandleManager(max_size=tf_cfg.fetch)
+                    cm = CandleManager(
+                        max_size=tf_cfg.fetch,
+                        timeframe_seconds=self.app_config.get_timeframe_seconds(tf)
+                    )
                     sync = CandleSync(
-                        rest_client=self.rest_client,
-                        symbol=symbol,
+                        rest_client=self.rest,
+                        symbol=sym,
                         timeframe=tf,
                         candle_manager=cm,
                         app_config=self.app_config,
                     )
-                    # IMPORTANT: CandleSync callback is (symbol, timeframe, candle)
-                    sync.set_callback(self._on_validated_candle)
 
-                    self.candle_managers[key] = cm
-                    self.candle_syncs[key] = sync
+                    sync.set_callback(self._validated_callback)
 
-                    self.logger.info(f"✓ Managers created for {symbol} {tf}")
+                    self.cm[key] = cm
+                    self.sync[key] = sync
+
+                    self.logger.info(f"[Init] Manager+Sync ready for {sym} {tf}")
+
                 except Exception as e:
-                    self.logger.error(f"Failed to create managers for {symbol} {tf}: {e}")
+                    self.logger.error(f"[Init] Failed for {sym} {tf}: {e}")
 
-        if not self.candle_managers:
-            self.logger.error("No candle managers created!")
-            return False
+        # -------------------------------------------------------
+        # Initial REST Load (Parallel per Symbol)
+        # -------------------------------------------------------
+        loader = InitialCandlesLoader(self.app_config, self.rest)
 
-        # -------------------------------------------------
-        # Initial candles loading (parallel)
-        # -------------------------------------------------
-        self.logger.info("\n[5/6] Loading initial historical candles (parallel)...")
-        loader = InitialCandlesLoader(self.app_config, self.rest_client)
+        with ThreadPoolExecutor(max_workers=len(enabled)) as ex:
+            futures = {}
+            for s in enabled:
+                sym = s.name
+                cm_map = {t.tf: self.cm[(sym, t.tf)] for t in s.timeframes}
+                sync_map = {t.tf: self.sync[(sym, t.tf)] for t in s.timeframes}
 
-        with ThreadPoolExecutor(max_workers=len(enabled_symbols)) as executor:
-            tasks: Dict[object, str] = {}
-
-            for sym_cfg in enabled_symbols:
-                symbol = sym_cfg.name
-
-                cm_dict = {
-                    tf_cfg.tf: self.candle_managers[(symbol, tf_cfg.tf)]
-                    for tf_cfg in sym_cfg.timeframes
-                }
-                sync_dict = {
-                    tf_cfg.tf: self.candle_syncs[(symbol, tf_cfg.tf)]
-                    for tf_cfg in sym_cfg.timeframes
-                }
-
-                fut = executor.submit(
+                f = ex.submit(
                     loader.load_initial_for_symbol,
-                    symbol_cfg=sym_cfg,
-                    candle_managers=cm_dict,
-                    candle_syncs=sync_dict,
+                    symbol_cfg=s,
+                    candle_managers=cm_map,
+                    candle_syncs=sync_map,
                     liquidity_maps=None,
                     storage=self.storage,
+                    use_reverse_recovery=True,
                 )
-                tasks[fut] = symbol
-                self.logger.info(f"Submitted {symbol} for parallel initial load...")
+                futures[f] = sym
+                self.logger.info(f"[InitialLoad] Submitted {sym}")
 
-            for fut in as_completed(tasks):
-                symbol = tasks[fut]
+            for f in as_completed(futures):
+                sym = futures[f]
                 try:
-                    ok = fut.result()
+                    ok = f.result()
                     if ok:
-                        self.logger.info(f"✓ {symbol}: initial load complete")
+                        self.logger.info(f"[InitialLoad] {sym} READY")
                     else:
-                        self.logger.warning(f"{symbol}: initial load incomplete (some TFs may have failed)")
+                        self.logger.warning(f"[InitialLoad] {sym} incomplete")
                 except Exception as e:
-                    self.logger.error(f"{symbol}: initial load error: {e}")
+                    self.logger.error(f"[InitialLoad] {sym} FAILED: {e}")
 
-        # -------------------------------------------------
-        # Setup WebSocket client & subscriptions
-        # -------------------------------------------------
-        self.logger.info("\n[6/6] Setting up WebSocket client & subscriptions...")
+        # -------------------------------------------------------
+        # WS Client + Subscriptions
+        # -------------------------------------------------------
         try:
-            self.ws_client = WebSocketClient(self.app_config)
+            self.ws = WebSocketClient(self.app_config)
 
-            for sym_cfg in enabled_symbols:
-                symbol = sym_cfg.name
+            for s in enabled:
+                sym = s.name
 
-                for tf_cfg in sym_cfg.timeframes:
+                for tf_cfg in s.timeframes:
                     tf = tf_cfg.tf
 
-                    # ---- FIXED CALLBACK CLOSURE ----
-                    def make_callback(sym: str, timeframe: str):
-                        km_key = (sym, timeframe)
+                    # correct closure
+                    def make_cb(symbol=sym, timeframe=tf):
+                        key = (symbol, timeframe)
 
                         def cb(candle: dict):
-                            """
-                            WebSocket callback for one stream.
-                            IMPORTANT: WebSocketClient must call this with ONE arg → candle dict.
-                            """
                             try:
-                                sync_obj = self.candle_syncs[km_key]
-                                sync_obj.on_ws_closed_candle(candle, storage=self.storage)
+                                self.sync[key].on_ws_closed_candle(
+                                    candle,
+                                    storage=self.storage
+                                )
                             except Exception as exc:
                                 self.logger.error(
-                                    f"[WebSocket] Callback error for {sym} {timeframe}: {exc}"
+                                    f"[WS] Callback error {symbol} {timeframe}: {exc}"
                                 )
 
                         return cb
 
-                    self.ws_client.subscribe(
-                        symbol=symbol,
+                    self.ws.subscribe(
+                        symbol=sym,
                         timeframe=tf,
-                        callback=make_callback(symbol, tf),
+                        callback=make_cb(sym, tf)
                     )
-                    self.logger.info(f"✓ Subscribed WS stream for {symbol} {tf}")
-
-            self.logger.info("✓ WebSocket client configured")
+                    self.logger.info(f"[WS] Subscribed {sym} {tf}")
 
         except Exception as e:
-            self.logger.error(f"WebSocket setup error: {e}")
+            self.logger.error(f"[WS] Setup failed: {e}")
             return False
 
+        # -------------------------------------------------------
+        # Start Health API
+        # -------------------------------------------------------
         self._start_health_api()
-        self.logger.info("\nInitialization COMPLETE ✅")
+
+        self.logger.info("Initialization COMPLETE ✓")
         return True
 
-    # -------------------------------------------------------------------------
-    # HEALTH ENDPOINT
-    # -------------------------------------------------------------------------
+    # ======================================================================
+    # VALIDATED CANDLE CALLBACK
+    # ======================================================================
+
+    def _validated_callback(self, symbol: str, timeframe: str, candle: dict):
+        self.logger.info(
+            f"[VALIDATED] {symbol} {timeframe} ts={candle['ts']} "
+            f"close={candle['close']} vol={candle['volume']}"
+        )
+        # Strategy plug-in point here
+
+    # ======================================================================
+    # HEALTH API
+    # ======================================================================
 
     def _start_health_api(self):
-        """Start minimal HTTP health check endpoint."""
-        app = Flask(__name__)
+        app = Flask("health-check")
         self.health_app = app
 
         @app.get("/health")
         def health():
-            symbols_status: Dict[str, Dict[str, dict]] = {}
-
-            for (symbol, tf), cm in self.candle_managers.items():
-                if symbol not in symbols_status:
-                    symbols_status[symbol] = {"timeframes": {}}
-                symbols_status[symbol]["timeframes"][tf] = {
-                    "candles": len(cm.get_all()),
-                    "last_ts": cm.last_timestamp(),
+            data = {}
+            for (sym, tf), cm in self.cm.items():
+                if sym not in data:
+                    data[sym] = {}
+                data[sym][tf] = {
+                    "count": len(cm),
+                    "last_ts": cm.last_open_time(),
                 }
 
-            return jsonify(
-                {
-                    "status": "running" if self.is_running else "stopped",
-                    "timestamp": datetime.now().isoformat(),
-                    "symbols": list(symbols_status.keys()),
-                    "symbols_detail": symbols_status,
-                    "websocket": "connected"
-                    if (self.ws_client and self.ws_client.is_alive())
-                    else "disconnected",
-                }
-            )
+            return jsonify({
+                "status": "running" if self.is_running else "stopped",
+                "time": datetime.utcnow().isoformat(),
+                "symbols": data,
+                "ws": "connected" if self.ws and self.ws.is_alive() else "disconnected",
+            })
 
-        def run_api():
+        def run():
             app.run(
                 host="0.0.0.0",
                 port=self.health_port,
@@ -299,143 +306,97 @@ class TradingBot:
                 use_reloader=False,
             )
 
-        self.health_server_thread = threading.Thread(target=run_api, daemon=True)
-        self.health_server_thread.start()
+        self.health_thread = threading.Thread(target=run, daemon=True)
+        self.health_thread.start()
 
-        self.logger.info(f"✓ Health API running at http://0.0.0.0:{self.health_port}/health")
-
-    # -------------------------------------------------------------------------
-    # CALLBACK FOR VALIDATED CANDLE (FROM CandleSync)
-    # -------------------------------------------------------------------------
-
-    def _on_validated_candle(self, symbol: str, timeframe: str, candle: dict):
-        """
-        Called by CandleSync when a candle is fully validated & gap-filled.
-
-        Here is where future LiquidityMap / Strategy Engine / Execution Layer will attach.
-        """
         self.logger.info(
-            f"[VALIDATED] {symbol} {timeframe} "
-            f"open_ts={candle['ts']} close={candle['close']} vol={candle['volume']}"
+            f"[Health] Running at http://0.0.0.0:{self.health_port}/health"
         )
-        # TODO:
-        # - LiquidityMap.on_candle(...)
-        # - Strategy evaluation
-        # - Signal aggregation & execution
 
-    # -------------------------------------------------------------------------
-    # START & RUN
-    # -------------------------------------------------------------------------
+    # ======================================================================
+    # START
+    # ======================================================================
 
     def start(self) -> bool:
-        """Start the trading bot (WebSocket loop)."""
-        if not self.ws_client:
-            self.logger.error("Bot not initialized. Call initialize() first.")
+        if not self.ws:
+            self.logger.error("Initialize before start().")
             return False
 
-        self.logger.info("\nStarting Trading Bot WebSocket...")
+        self.logger.info("[TradingBot] Starting WS…")
         try:
-            self.ws_client.start()
+            self.ws.start()
             self.is_running = True
-            self.logger.info("🚀 Trading Bot is LIVE and processing candles!")
+            self.logger.info("TradingBot LIVE ✓")
             return True
         except Exception as e:
-            self.logger.error(f"Failed to start WebSocket: {e}")
+            self.logger.error(f"[TradingBot] Failed to start WS: {e}")
             return False
 
+    # ======================================================================
+    # MAIN LOOP
+    # ======================================================================
+
     def run(self):
-        """Main run loop (status/logging)."""
         try:
             while self.is_running:
-                time.sleep(60)
-                self._print_status()
+                time.sleep(30)
+                self._log_status()
         except KeyboardInterrupt:
-            self.logger.info("Keyboard interrupt received.")
+            pass
         finally:
             self.stop()
 
-    def _print_status(self):
-        """Periodic status log."""
-        self.logger.info("\n" + "─" * 70)
-        self.logger.info("Status Update")
-        self.logger.info("─" * 70)
+    def _log_status(self):
+        self.logger.info("─" * 60)
+        self.logger.info("STATUS UPDATE")
 
-        symbols_data: Dict[str, Dict[str, dict]] = {}
-
-        for (symbol, tf), cm in self.candle_managers.items():
-            if symbol not in symbols_data:
-                symbols_data[symbol] = {}
-            last_candle = cm.get_latest_candle()
-            symbols_data[symbol][tf] = {
-                "candle_count": len(cm.get_all()),
-                "last_candle": last_candle,
-            }
-
-        for symbol, tfs in symbols_data.items():
-            self.logger.info(f"\n{symbol}:")
-            for tf, data in tfs.items():
-                last_c = data["last_candle"]
-                close_val = last_c["close"] if last_c else 0.0
-                last_ts = last_c["ts"] if last_c else None
+        for (sym, tf), cm in self.cm.items():
+            last = cm.get_latest_candle()
+            if last:
                 self.logger.info(
-                    f"  {tf}: {data['candle_count']} candles, "
-                    f"last_open_ts={last_ts}, close={close_val}"
+                    f"{sym} {tf}: {len(cm)} candles, last_ts={last['ts']} close={last['close']}"
                 )
 
-    # -------------------------------------------------------------------------
-    # SHUTDOWN
-    # -------------------------------------------------------------------------
+    # ======================================================================
+    # STOP
+    # ======================================================================
 
     def stop(self):
-        """Stop the trading bot gracefully."""
         if not self.is_running:
             return
 
-        self.logger.info("\n" + "=" * 80)
-        self.logger.info("Stopping Trading Bot...")
-        self.logger.info("=" * 80)
-
         self.is_running = False
+        self.logger.info("Stopping TradingBot…")
 
-        # Stop WebSocket
-        if self.ws_client:
-            self.logger.info("Stopping WebSocket...")
-            self.ws_client.stop()
-            self.logger.info("✓ WebSocket stopped")
+        if self.ws:
+            try:
+                self.ws.stop()
+                self.logger.info("[WS] Stopped")
+            except Exception as e:
+                self.logger.error(f"[WS] Stop error: {e}")
 
-        # Close REST client
-        if self.rest_client:
-            self.logger.info("Closing REST client...")
-            self.rest_client.close()
-            self.logger.info("✓ REST client closed")
+        if self.rest:
+            try:
+                self.rest.close()
+            except:
+                pass
 
-        # Shutdown storage executor
         if self.storage:
-            self.logger.info("Shutting down storage...")
             try:
                 self.storage.shutdown()
-                self.logger.info("✓ Storage shutdown complete")
+                self.logger.info("[Storage] Shutdown complete")
             except Exception as e:
-                self.logger.error(f"Error shutting down storage: {e}")
+                self.logger.error(f"[Storage] Shutdown failed: {e}")
 
-        self.logger.info("\n" + "=" * 80)
-        self.logger.info("✓ Trading Bot Stopped")
-        self.logger.info("=" * 80)
+        self.logger.info("TradingBot STOPPED ✓")
 
 
 def main() -> int:
-    """Main entry point."""
-    logger = get_logger(__name__)
     bot = TradingBot()
-
     if not bot.initialize():
-        logger.error("Failed to initialize bot!")
         return 1
-
     if not bot.start():
-        logger.error("Failed to start bot!")
         return 1
-
     bot.run()
     return 0
 

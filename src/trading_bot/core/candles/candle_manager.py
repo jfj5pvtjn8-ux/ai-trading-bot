@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections import deque
 from typing import Deque, List, Dict, Any, Optional, Tuple
 
@@ -6,96 +8,136 @@ Candle = Dict[str, Any]
 
 class CandleManager:
     """
-    Efficient sliding-window storage for Multi-Timeframe candles.
+    High-performance sliding-window candle storage (one CM per symbol–timeframe).
 
-    Assumptions about candle dict format:
-      - 'ts'      → OPEN timestamp in seconds (same as 'open_ts')
-      - 'open_ts' → OPEN timestamp in seconds (optional alias, but recommended)
-      - 'close_ts'→ CLOSE timestamp in seconds (optional)
-      - 'open', 'high', 'low', 'close', 'volume' present
+    Features:
+    ----------
+    • O(1) append via deque(maxlen)
+    • Strictly increasing OPEN timestamp enforcement
+    • Binary-search O(log N) candle lookup by timestamp
+    • Rich helpers for LiquidityMap / strategy engines
+    • Backfill utilities (reverse gap cleanup)
+    • Optional timeframe integrity diagnostics (non-blocking)
 
-    This matches both RestClient and WebSocketClient normalization.
+    Primary timestamp field:
+        ts = candle open timestamp (seconds)
     """
 
-    def __init__(self, max_size: int):
+    # =====================================================================
+    # INIT
+    # =====================================================================
+
+    def __init__(self, max_size: int, timeframe_seconds: Optional[int] = None):
         """
         Args:
-            max_size: Maximum number of candles to store (from timeframe config)
+            max_size: Maximum candles to keep in memory.
+            timeframe_seconds: Optional, used for optional gap diagnostics.
         """
-        self._max_size: int = max_size
-        self._candles: Deque[Candle] = deque(maxlen=self._max_size)
+        self._max_size = max_size
+        self._tf_sec = timeframe_seconds
+        self._candles: Deque[Candle] = deque(maxlen=max_size)
 
-    # ---------------------------------------------------------
+    # =====================================================================
+    # INTERNAL HELPERS
+    # =====================================================================
+
+    @staticmethod
+    def _get_ts(c: Candle) -> int:
+        """Return candle open timestamp (ts > open_ts)."""
+        if "ts" in c and c["ts"] is not None:
+            return int(c["ts"])
+        if "open_ts" in c and c["open_ts"] is not None:
+            return int(c["open_ts"])
+        raise KeyError(f"Candle missing 'ts'/'open_ts': {c}")
+
+    @staticmethod
+    def _ensure_ts(c: Candle) -> Candle:
+        """Ensure candle has canonical ts field."""
+        if "ts" in c:
+            return c
+        if "open_ts" in c:
+            cpy = dict(c)
+            cpy["ts"] = int(c["open_ts"])
+            return cpy
+        raise KeyError("Candle missing both ts and open_ts")
+
+    # =====================================================================
     # INITIAL LOAD
-    # ---------------------------------------------------------
+    # =====================================================================
 
     def load_initial(self, candles: List[Candle]) -> None:
         """
-        Loads initial historical candles into sliding window.
+        Load historical candles (REST). Clears previous data.
 
-        - Assumes candles are ordered oldest → newest.
-        - Used ONLY during Initial Load via REST.
+        • Sorts by open timestamp ascending
+        • Normalizes ts / open_ts
+        • Trims to last max_size candles
         """
-        for c in candles:
-            self._candles.append(c)
+        self._candles.clear()
 
-    # ---------------------------------------------------------
-    # REAL-TIME APPEND (via CandleSync)
-    # ---------------------------------------------------------
+        if not candles:
+            return
+
+        normalized = [self._ensure_ts(c) for c in candles]
+        normalized.sort(key=self._get_ts)
+
+        if len(normalized) > self._max_size:
+            normalized = normalized[-self._max_size:]
+
+        self._candles.extend(normalized)
+
+    # =====================================================================
+    # REAL-TIME APPEND
+    # =====================================================================
 
     def add_closed_candle(self, candle: Candle) -> None:
         """
-        Add a new closed candle, ensuring proper timestamp order.
-        Should ONLY be called by CandleSync or Initial Loader.
+        Add new closed candle (WS).  
+        Enforces strictly increasing ts.
 
-        Uses candle['ts'] as the master time index (open timestamp).
+        Out-of-order or duplicate candles are silently ignored.
         """
-        if not self._candles:
-            self._candles.append(candle)
-            return
+        c = self._ensure_ts(candle)
+        new_ts = self._get_ts(c)
 
-        last_ts = self._candles[-1]["ts"]
+        if self._candles:
+            last_ts = self._get_ts(self._candles[-1])
+            if new_ts <= last_ts:
+                return  # ignore duplicate or older
 
-        # Prevent duplicates, out-of-order data
-        if candle["ts"] <= last_ts:
-            return
+        self._candles.append(c)
 
-        self._candles.append(candle)
-
-    # ---------------------------------------------------------
+    # =====================================================================
     # BASIC GETTERS
-    # ---------------------------------------------------------
+    # =====================================================================
 
     def get_all(self) -> List[Candle]:
-        """Returns all candles as a list (copy)."""
         return list(self._candles)
 
     def get_window(self) -> Deque[Candle]:
-        """
-        Returns the underlying deque WITHOUT copying.
-
-        NOTE: This is a live view. Callers SHOULD treat it as read-only.
-        Mutating it directly can break CandleSync / LiquidityMap assumptions.
-        """
+        """Returns the live deque — treat as read-only."""
         return self._candles
 
-    def last_timestamp(self) -> Optional[int]:
-        """
-        Returns timestamp of latest closed candle (OPEN time in seconds).
+    def __len__(self) -> int:
+        return len(self._candles)
 
-        This is the same as candle['ts'] and, by convention, candle['open_ts'].
-        """
+    def __bool__(self) -> bool:
+        return bool(self._candles)
+
+    # ---------------------------------------------------------------------
+
+    def last_timestamp(self) -> Optional[int]:
         if not self._candles:
             return None
-        return int(self._candles[-1]["ts"])
+        return self._get_ts(self._candles[-1])
+
+    def first_timestamp(self) -> Optional[int]:
+        if not self._candles:
+            return None
+        return self._get_ts(self._candles[0])
 
     def last_open_time(self) -> Optional[int]:
-        """
-        Alias for last_timestamp() to make intent explicit:
-        last OPEN candle time (seconds).
-
-        InitialCandlesLoader / CandleSync can call either.
-        """
+        """Alias for clarity."""
         return self.last_timestamp()
 
     def get_latest_candle(self) -> Optional[Candle]:
@@ -103,88 +145,99 @@ class CandleManager:
             return None
         return self._candles[-1]
 
-    def get_latest_close(self) -> Optional[float]:
+    # =====================================================================
+    # LOOKUPS (Binary Search)
+    # =====================================================================
+
+    def get_by_timestamp(self, ts: int) -> Optional[Candle]:
+        """
+        Binary search inside deque.
+        O(log N), highly efficient for windows up to 10k+.
+        """
+        ts = int(ts)
         if not self._candles:
             return None
-        return float(self._candles[-1]["close"])
 
-    def get_latest_high(self) -> Optional[float]:
-        if not self._candles:
-            return None
-        return float(self._candles[-1]["high"])
+        lo, hi = 0, len(self._candles) - 1
+        while lo <= hi:
+            m = (lo + hi) // 2
+            mid_ts = self._get_ts(self._candles[m])
 
-    def get_latest_low(self) -> Optional[float]:
-        if not self._candles:
-            return None
-        return float(self._candles[-1]["low"])
+            if mid_ts == ts:
+                return self._candles[m]
+            if mid_ts < ts:
+                lo = m + 1
+            else:
+                hi = m - 1
 
-    # ---------------------------------------------------------
-    # UTILITY HELPERS FOR LIQUIDITY MAP
-    # ---------------------------------------------------------
+        return None
+
+    def contains_timestamp(self, ts: int) -> bool:
+        """Fast existence check."""
+        return self.get_by_timestamp(ts) is not None
+
+    # =====================================================================
+    # RANGE / STRUCTURAL HELPERS
+    # =====================================================================
 
     def last_n(self, n: int) -> List[Candle]:
-        """Return last N candles (default dictionary objects)."""
-        if n >= len(self._candles):
+        """Return last N candles as list."""
+        size = len(self._candles)
+        if n >= size:
             return list(self._candles)
-        # slicing a list copy is OK; deque slicing is not supported
-        return list(self._candles)[-n:]
+        start = size - n
+        return [self._candles[i] for i in range(start, size)]
 
     def highest_in_last(self, n: int) -> Optional[float]:
-        """
-        Highest high in last N candles.
-
-        Returns None if there are no candles.
-        """
-        window = self.last_n(n)
-        if not window:
+        win = self.last_n(n)
+        if not win:
             return None
-        return max(float(c["high"]) for c in window)
+        return max(float(c["high"]) for c in win)
 
     def lowest_in_last(self, n: int) -> Optional[float]:
-        """
-        Lowest low in last N candles.
-
-        Returns None if there are no candles.
-        """
-        window = self.last_n(n)
-        if not window:
+        win = self.last_n(n)
+        if not win:
             return None
-        return min(float(c["low"]) for c in window)
+        return min(float(c["low"]) for c in win)
 
     def last_two(self) -> Tuple[Optional[Candle], Optional[Candle]]:
-        """
-        Returns last two candles (useful for CHOCH/BOS, sweeps).
-
-        Returns:
-            (prev_candle, last_candle)
-            If there are fewer than 2 candles, one or both will be None.
-        """
         if len(self._candles) == 0:
             return None, None
         if len(self._candles) == 1:
             return None, self._candles[-1]
         return self._candles[-2], self._candles[-1]
 
-    def get_by_timestamp(self, ts: int) -> Optional[Candle]:
+    # =====================================================================
+    # ADVANCED UTILITIES (Optional but useful)
+    # =====================================================================
+
+    def drop_until(self, ts: int) -> None:
         """
-        Return the candle whose ts (open timestamp) equals the given value.
-
-        This is O(n) over the sliding window but cheap for typical sizes.
+        Remove candles until next >= ts.
+        Used during reverse-sync on bot restart if needed.
         """
-        for c in reversed(self._candles):
-            if int(c["ts"]) == int(ts):
-                return c
-        return None
+        ts = int(ts)
+        while self._candles and self._get_ts(self._candles[0]) < ts:
+            self._candles.popleft()
 
-    # ---------------------------------------------------------
-    # DUNDER HELPERS
-    # ---------------------------------------------------------
+    def has_gap(self) -> bool:
+        """
+        Optional diagnostic:
+        Check if internal deque contains gaps.
 
-    def __len__(self) -> int:
-        return len(self._candles)
+        Not enforced — CandleSync owns gap logic.
+        """
+        if len(self._candles) < 2 or self._tf_sec is None:
+            return False
 
-    def __bool__(self) -> bool:
-        return bool(self._candles)
+        expected = self._get_ts(self._candles[0])
+        for c in self._candles:
+            ts = self._get_ts(c)
+            if ts != expected:
+                return True
+            expected += self._tf_sec
+
+        return False
 
 
 __all__ = ["CandleManager"]
