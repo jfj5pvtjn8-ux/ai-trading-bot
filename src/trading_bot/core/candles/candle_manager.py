@@ -7,8 +7,14 @@ Candle = Dict[str, Any]
 class CandleManager:
     """
     Efficient sliding-window storage for Multi-Timeframe candles.
-    Supports O(1) append/pop, timestamp ordering, last-candle lookup,
-    and fast access for LiquidityMap and feature extraction.
+
+    Assumptions about candle dict format:
+      - 'ts'      → OPEN timestamp in seconds (same as 'open_ts')
+      - 'open_ts' → OPEN timestamp in seconds (optional alias, but recommended)
+      - 'close_ts'→ CLOSE timestamp in seconds (optional)
+      - 'open', 'high', 'low', 'close', 'volume' present
+
+    This matches both RestClient and WebSocketClient normalization.
     """
 
     def __init__(self, max_size: int):
@@ -22,6 +28,7 @@ class CandleManager:
     # ---------------------------------------------------------
     # INITIAL LOAD
     # ---------------------------------------------------------
+
     def load_initial(self, candles: List[Candle]) -> None:
         """
         Loads initial historical candles into sliding window.
@@ -35,10 +42,13 @@ class CandleManager:
     # ---------------------------------------------------------
     # REAL-TIME APPEND (via CandleSync)
     # ---------------------------------------------------------
+
     def add_closed_candle(self, candle: Candle) -> None:
         """
         Add a new closed candle, ensuring proper timestamp order.
         Should ONLY be called by CandleSync or Initial Loader.
+
+        Uses candle['ts'] as the master time index (open timestamp).
         """
         if not self._candles:
             self._candles.append(candle)
@@ -55,6 +65,7 @@ class CandleManager:
     # ---------------------------------------------------------
     # BASIC GETTERS
     # ---------------------------------------------------------
+
     def get_all(self) -> List[Candle]:
         """Returns all candles as a list (copy)."""
         return list(self._candles)
@@ -69,10 +80,23 @@ class CandleManager:
         return self._candles
 
     def last_timestamp(self) -> Optional[int]:
-        """Returns timestamp of latest closed candle."""
+        """
+        Returns timestamp of latest closed candle (OPEN time in seconds).
+
+        This is the same as candle['ts'] and, by convention, candle['open_ts'].
+        """
         if not self._candles:
             return None
-        return self._candles[-1]["ts"]
+        return int(self._candles[-1]["ts"])
+
+    def last_open_time(self) -> Optional[int]:
+        """
+        Alias for last_timestamp() to make intent explicit:
+        last OPEN candle time (seconds).
+
+        InitialCandlesLoader / CandleSync can call either.
+        """
+        return self.last_timestamp()
 
     def get_latest_candle(self) -> Optional[Candle]:
         if not self._candles:
@@ -97,6 +121,7 @@ class CandleManager:
     # ---------------------------------------------------------
     # UTILITY HELPERS FOR LIQUIDITY MAP
     # ---------------------------------------------------------
+
     def last_n(self, n: int) -> List[Candle]:
         """Return last N candles (default dictionary objects)."""
         if n >= len(self._candles):
@@ -140,9 +165,21 @@ class CandleManager:
             return None, self._candles[-1]
         return self._candles[-2], self._candles[-1]
 
+    def get_by_timestamp(self, ts: int) -> Optional[Candle]:
+        """
+        Return the candle whose ts (open timestamp) equals the given value.
+
+        This is O(n) over the sliding window but cheap for typical sizes.
+        """
+        for c in reversed(self._candles):
+            if int(c["ts"]) == int(ts):
+                return c
+        return None
+
     # ---------------------------------------------------------
     # DUNDER HELPERS
     # ---------------------------------------------------------
+
     def __len__(self) -> int:
         return len(self._candles)
 

@@ -16,6 +16,7 @@ import json
 import time
 import threading
 from typing import Dict, Callable, Optional, Any, List
+
 from websocket import WebSocketApp
 
 from trading_bot.core.logger import get_logger
@@ -55,11 +56,15 @@ class WebSocketClient:
     # PUBLIC API
     # -------------------------------------------------------------------------
 
-    def subscribe(self, symbol: str, timeframe: str,
-                  callback: Callable[[Dict[str, Any]], None]):
+    def subscribe(
+        self,
+        symbol: str,
+        timeframe: str,
+        callback: Callable[[Dict[str, Any]], None],
+    ):
         """
         Subscribe to a stream such as btcusdt@kline_1m.
-        Callback ALWAYS receives exactly: callback(candle)
+        Callback ALWAYS receives exactly: callback(candle_dict)
         """
         stream = f"{symbol.lower()}@kline_{timeframe}"
 
@@ -116,7 +121,7 @@ class WebSocketClient:
         if self.ws:
             try:
                 self.ws.close()
-            except:
+            except Exception:
                 pass
 
         if self.ws_thread and self.ws_thread.is_alive():
@@ -196,6 +201,8 @@ class WebSocketClient:
                 return
 
             candle = self._normalize_kline(k)
+            if not candle:
+                return
 
             cb = self.callbacks.get(stream)
             if cb:
@@ -212,14 +219,28 @@ class WebSocketClient:
     # -------------------------------------------------------------------------
 
     def _normalize_kline(self, k: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert raw kline into internal normalized format."""
+        """
+        Convert raw Binance kline into internal normalized format.
+
+        IMPORTANT:
+        - open_ts (seconds) = k["t"] // 1000
+        - close_ts (seconds) = k["T"] // 1000
+        - ts == open_ts (same convention as RestClient)
+        """
         try:
-            ts = k.get("T")
-            if ts is None:
-                raise ValueError("Missing close timestamp T")
+            open_ms = k.get("t")
+            close_ms = k.get("T")
+            if open_ms is None or close_ms is None:
+                raise ValueError("Missing kline timestamps t/T")
+
+            open_ts = int(open_ms) // 1000
+            close_ts = int(close_ms) // 1000
 
             return {
-                "ts": int(ts) // 1000,
+                "open_ts": open_ts,
+                "close_ts": close_ts,
+                "ts": open_ts,  # master time index
+
                 "open": float(k["o"]),
                 "high": float(k["h"]),
                 "low": float(k["l"]),

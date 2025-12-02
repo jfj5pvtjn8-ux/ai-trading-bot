@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
 """
-Comprehensive Parquet File Validator
+Unified Parquet Validator (aligned with new unified candle schema)
 
-This script validates all parquet files in the data/live directory for:
-- File existence and readability
-- Candle counts
-- Sequential timestamps (no gaps)
-- Duplicate timestamps
-- Correct ordering
-- Data integrity (valid OHLCV values)
-- Time range coverage
-- Missing candles compared to expected count
-- Timestamp alignment (Binance close-time semantics)
-- Future timestamps
+Validates parquet candles with structure:
 
-Usage:
-    python validate_parquet.py
-    python validate_parquet.py --dir data/live
-    python validate_parquet.py --symbol BTCUSDT --date 2025-11-30
+Required (new schema):
+- symbol
+- timeframe
+- timestamp   (alias for open_ts)
+- open_ts
+- close_ts
+- datetime
+- open, high, low, close
+- volume
+- received_at
+
+Also supports older files where only 'timestamp' exists
+and open_ts was not present.
+
+Validation includes:
+- File existence + readability
+- Required columns present
+- Sequential timestamps (open_ts)
+- Gap detection based on timeframe
+- Duplicate timestamp detection
+- Misalignment to TF interval
+- Future timestamp check
+- OHLCV integrity
+- Mismatched fields (open_ts != timestamp)
 """
 
 import argparse
@@ -31,21 +41,20 @@ from tabulate import tabulate
 
 
 class ParquetValidator:
-    """Validates trading candle parquet files."""
+    """Validates unified parquet candle files."""
 
-    # Timeframe configurations (seconds + expected candles in a "full" file)
-    TIMEFRAMES: Dict[str, Dict[str, int]] = {
-        "1m": {"interval": 60, "expected": 3000, "desc": "1 minute"},
-        "5m": {"interval": 300, "expected": 1500, "desc": "5 minutes"},
-        "15m": {"interval": 900, "expected": 800, "desc": "15 minutes"},
-        "1h": {"interval": 3600, "expected": 400, "desc": "1 hour"},
+    # Timeframe → seconds
+    TF = {
+        "1m": 60,
+        "5m": 300,
+        "15m": 900,
+        "1h": 3600,
     }
 
-    REQUIRED_COLUMNS = [
+    REQUIRED = [
         "symbol",
         "timeframe",
         "timestamp",
-        "datetime",
         "open",
         "high",
         "low",
@@ -54,522 +63,392 @@ class ParquetValidator:
         "received_at",
     ]
 
-    def __init__(self, data_dir: str = "data/live"):
-        """Initialize validator with data directory."""
-        self.data_dir = Path(data_dir)
-        self.results: List[Dict] = []
-        self.errors: List[str] = []
-        self.warnings: List[str] = []
+    OPTIONAL = [
+        "open_ts",
+        "close_ts",
+        "datetime",
+    ]
 
-    # ------------------------------------------------------------------ #
-    # Helpers
-    # ------------------------------------------------------------------ #
+    def __init__(self, data_dir="data/live"):
+        self.dir = Path(data_dir)
+        self.results = []
+        self.errors = []
+        self.warnings = []
 
-    def find_parquet_files(
-        self,
-        symbol: Optional[str] = None,
-        date_str: Optional[str] = None,
-    ) -> List[Path]:
-        """Find all parquet files matching criteria."""
+    # ----------------------------------------------------------------------
+    # File discovery
+    # ----------------------------------------------------------------------
+
+    def find_files(self, symbol=None, date=None) -> List[Path]:
         pattern = "*"
         if symbol:
             pattern = f"{symbol}_*"
-        if date_str:
-            pattern = f"{pattern}{date_str}.parquet"
+        if date:
+            pattern = f"{pattern}{date}.parquet"
         else:
             pattern = f"{pattern}*.parquet"
+        return sorted(self.dir.glob(pattern))
 
-        files = list(self.data_dir.glob(pattern))
-        return sorted(files)
+    # ----------------------------------------------------------------------
+    # Basic file validation
+    # ----------------------------------------------------------------------
 
-    def validate_file_structure(self, file_path: Path) -> Dict:
-        """Validate basic file structure and columns."""
+    def validate_structure(self, fp: Path) -> Tuple[Optional[pd.DataFrame], dict]:
         result = {
-            "file": file_path.name,
-            "exists": file_path.exists(),
+            "file": fp.name,
+            "exists": fp.exists(),
             "readable": False,
-            "size_mb": 0.0,
-            "columns_ok": False,
+            "size_mb": 0,
             "row_count": 0,
+            "columns_ok": False,
+            "missing_cols": [],
         }
 
-        if not file_path.exists():
-            self.errors.append(f"{file_path.name}: File does not exist")
-            return result
+        if not fp.exists():
+            self.errors.append(f"{fp.name}: File does not exist")
+            return None, result
 
         try:
-            df = pd.read_parquet(file_path)
+            df = pd.read_parquet(fp)
             result["readable"] = True
-            result["size_mb"] = round(file_path.stat().st_size / (1024 * 1024), 2)
+            result["size_mb"] = round(fp.stat().st_size / (1024 * 1024), 2)
             result["row_count"] = len(df)
 
-            # Check columns
-            missing_cols = set(self.REQUIRED_COLUMNS) - set(df.columns)
-            if missing_cols:
-                self.errors.append(
-                    f"{file_path.name}: Missing columns: {sorted(missing_cols)}"
-                )
-            else:
-                result["columns_ok"] = True
+            missing = set(self.REQUIRED) - set(df.columns)
+            result["missing_cols"] = list(missing)
+            result["columns_ok"] = len(missing) == 0
+
+            if missing:
+                self.errors.append(f"{fp.name}: Missing columns → {missing}")
+
+            return df, result
 
         except Exception as e:
-            self.errors.append(f"{file_path.name}: Failed to read - {e}")
+            self.errors.append(f"{fp.name}: Cannot read parquet → {e}")
+            return None, result
 
-        return result
+    # ----------------------------------------------------------------------
+    # Timestamp resolution
+    # ----------------------------------------------------------------------
 
-    def check_gaps(
-        self,
-        df: pd.DataFrame,
-        timeframe: str,
-        file_name: str,
-    ) -> Tuple[int, List[Dict]]:
-        """Check for gaps in timestamps."""
-        if timeframe not in self.TIMEFRAMES:
+    def resolve_timestamp(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Choose canonical timestamp series.
+        Priority:
+        1. open_ts (new schema)
+        2. timestamp (old + new alias)
+        """
+        if "open_ts" in df.columns:
+            return df["open_ts"].astype(int)
+
+        return df["timestamp"].astype(int)
+
+    # ----------------------------------------------------------------------
+    # Check duplicates
+    # ----------------------------------------------------------------------
+
+    def check_duplicates(self, ts: pd.Series, file: str):
+        dup = ts.duplicated()
+        count = int(dup.sum())
+        if count > 0:
+            vals = ts[dup].unique()[:5]
+            self.errors.append(f"{file}: Duplicate timestamps → {vals.tolist()}")
+        return count
+
+    # ----------------------------------------------------------------------
+    # Check ordering
+    # ----------------------------------------------------------------------
+
+    def check_order(self, ts: pd.Series, file: str):
+        if not ts.is_monotonic_increasing:
+            self.errors.append(f"{file}: Timestamps not sorted ascending")
+            return False
+        return True
+
+    # ----------------------------------------------------------------------
+    # Check gaps (open_ts)
+    # ----------------------------------------------------------------------
+
+    def check_gaps(self, ts: pd.Series, tf: str, file: str):
+        if tf not in self.TF:
             return 0, []
 
-        interval = self.TIMEFRAMES[timeframe]["interval"]
-        df_sorted = df.sort_values("timestamp").reset_index(drop=True)
+        interval = self.TF[tf]
+        ts_sorted = ts.sort_values().reset_index(drop=True)
+        diffs = ts_sorted.diff().iloc[1:]
 
-        time_diffs = df_sorted["timestamp"].diff()[1:]
-        gaps = time_diffs[time_diffs != interval]
+        gap_idx = diffs[diffs != interval].index
+        details = []
 
-        gap_details: List[Dict] = []
-        if len(gaps) > 0:
-            for idx in gaps.index:
-                prev_ts = df_sorted.loc[idx - 1, "timestamp"]
-                curr_ts = df_sorted.loc[idx, "timestamp"]
-                prev_dt = df_sorted.loc[idx - 1, "datetime"]
-                curr_dt = df_sorted.loc[idx, "datetime"]
+        for idx in gap_idx:
+            prev_ts = ts_sorted.iloc[idx - 1]
+            curr_ts = ts_sorted.iloc[idx]
+            missing = (curr_ts - prev_ts) // interval - 1
 
-                missing_candles = int((curr_ts - prev_ts) / interval) - 1
-
-                gap_details.append(
-                    {
-                        "prev_time": prev_dt,
-                        "next_time": curr_dt,
-                        "missing_seconds": curr_ts - prev_ts - interval,
-                        "missing_candles": missing_candles,
-                    }
-                )
-
-        return len(gaps), gap_details
-
-    def check_duplicates(self, df: pd.DataFrame, file_name: str) -> int:
-        """Check for duplicate timestamps."""
-        duplicates = df.duplicated(subset=["timestamp"], keep=False)
-        dup_count = int(duplicates.sum())
-
-        if dup_count > 0:
-            dup_timestamps = df[duplicates]["timestamp"].unique()
-            self.errors.append(
-                f"{file_name}: {dup_count} duplicate timestamps found "
-                f"(examples={list(dup_timestamps[:5])})"
+            details.append(
+                {
+                    "prev": datetime.fromtimestamp(prev_ts),
+                    "next": datetime.fromtimestamp(curr_ts),
+                    "missing": int(missing),
+                    "seconds_gap": int(curr_ts - prev_ts),
+                }
             )
 
-        return dup_count
+        if details:
+            self.errors.append(
+                f"{file}: {len(details)} timestamp gaps (open_ts-based)"
+            )
 
-    def check_ordering(self, df: pd.DataFrame, file_name: str) -> bool:
-        """Check if timestamps are properly ordered."""
-        is_sorted = df["timestamp"].is_monotonic_increasing
-        if not is_sorted:
-            self.errors.append(f"{file_name}: Timestamps not in ascending order")
-        return is_sorted
+        return len(details), details
 
-    def check_ohlcv_integrity(self, df: pd.DataFrame, file_name: str) -> Dict:
-        """Validate OHLCV data integrity."""
+    # ----------------------------------------------------------------------
+    # Alignment
+    # ----------------------------------------------------------------------
+
+    def check_alignment(self, ts: pd.Series, tf: str, file: str):
+        if tf not in self.TF:
+            return 0, []
+
+        interval = self.TF[tf]
+        misaligned = ts[ts % interval != 0]
+
+        if len(misaligned) > 0:
+            head = misaligned.head(5).tolist()
+            self.errors.append(
+                f"{file}: {len(misaligned)} misaligned timestamps → {head}"
+            )
+
+        return len(misaligned), misaligned.head(5).tolist()
+
+    # ----------------------------------------------------------------------
+    # Future timestamp check
+    # ----------------------------------------------------------------------
+
+    def check_future(self, ts: pd.Series, tf: str, file: str):
+        if tf not in self.TF:
+            return 0, []
+
+        interval = self.TF[tf]
+        now = int(datetime.now().timestamp())
+
+        future = ts[ts > now + interval]
+
+        if len(future) > 0:
+            head = future.head(5).tolist()
+            self.errors.append(
+                f"{file}: {len(future)} timestamps appear to be in the future → {head}"
+            )
+
+        return len(future), future.head(5).tolist()
+
+    # ----------------------------------------------------------------------
+    # OHLCV integrity
+    # ----------------------------------------------------------------------
+
+    def check_ohlcv(self, df: pd.DataFrame, file: str):
         issues = {
-            "high_low_mismatch": 0,
-            "open_close_range": 0,
-            "negative_volume": 0,
-            "zero_ohlc": 0,
+            "bad_high_low": int((df["high"] < df["low"]).sum()),
+            "open_outside_range": int(
+                ((df["open"] < df["low"]) | (df["open"] > df["high"])).sum()
+            ),
+            "close_outside_range": int(
+                ((df["close"] < df["low"]) | (df["close"] > df["high"])).sum()
+            ),
+            "negative_volume": int((df["volume"] < 0).sum()),
         }
 
-        # High should be >= Low
-        issues["high_low_mismatch"] = int((df["high"] < df["low"]).sum())
-
-        # Open and Close should be between Low and High
-        open_out_of_range = (df["open"] < df["low"]) | (df["open"] > df["high"])
-        close_out_of_range = (df["close"] < df["low"]) | (df["close"] > df["high"])
-        issues["open_close_range"] = int(
-            (open_out_of_range | close_out_of_range).sum()
-        )
-
-        # Volume should be non-negative
-        issues["negative_volume"] = int((df["volume"] < 0).sum())
-
-        # OHLC should not all be zero
-        all_zero = (
-            (df["open"] == 0)
-            & (df["high"] == 0)
-            & (df["low"] == 0)
-            & (df["close"] == 0)
-        )
-        issues["zero_ohlc"] = int(all_zero.sum())
-
-        for issue_type, count in issues.items():
+        for name, count in issues.items():
             if count > 0:
-                self.errors.append(f"{file_name}: {count} {issue_type} violations")
+                self.errors.append(f"{file}: {count} {name} violations")
 
         return issues
 
-    def check_time_range(self, df: pd.DataFrame, timeframe: str) -> Dict:
-        """Check time range and coverage."""
-        df_sorted = df.sort_values("timestamp")
+    # ----------------------------------------------------------------------
+    # open_ts vs timestamp mismatch
+    # ----------------------------------------------------------------------
 
-        first_time = pd.to_datetime(df_sorted.iloc[0]["datetime"])
-        last_time = pd.to_datetime(df_sorted.iloc[-1]["datetime"])
-        duration = last_time - first_time
-
-        expected_count = self.TIMEFRAMES.get(timeframe, {}).get("expected", 0)
-        actual_count = len(df_sorted)
-        coverage_pct = (actual_count / expected_count * 100) if expected_count > 0 else 0
-
-        return {
-            "first_candle": first_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "last_candle": last_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "duration_hours": round(duration.total_seconds() / 3600, 2),
-            "expected_count": expected_count,
-            "actual_count": actual_count,
-            "coverage_pct": round(coverage_pct, 1),
-        }
-
-    def check_alignment(
-        self,
-        df: pd.DataFrame,
-        timeframe: str,
-        file_name: str,
-    ) -> Tuple[int, List[int]]:
-        """
-        Check timestamp alignment to timeframe interval (open-time semantics).
-
-        For standard candle open times:
-        - timestamp is the candle OPEN time in seconds
-        - For interval = tf_seconds:
-            aligned  <=>  timestamp % tf_seconds == 0
-        """
-        if timeframe not in self.TIMEFRAMES:
-            return 0, []
-
-        interval = self.TIMEFRAMES[timeframe]["interval"]
-        df_sorted = df.sort_values("timestamp")
-
-        aligned_mask = df_sorted["timestamp"] % interval == 0
-        misaligned = df_sorted.loc[~aligned_mask, "timestamp"]
-
-        count = int(misaligned.shape[0])
-        examples = misaligned.head(5).tolist()
-
-        if count > 0:
-            self.errors.append(
-                f"{file_name}: {count} misaligned timestamps for tf={timeframe}, "
-                f"examples={examples}"
-            )
-
-        return count, examples
-
-    def check_future_timestamps(
-        self,
-        df: pd.DataFrame,
-        timeframe: str,
-        file_name: str,
-    ) -> Tuple[int, List[int]]:
-        """
-        Check for candles that appear to be in the future.
-
-        We allow a small tolerance of one interval to account for:
-        - slight clock skew
-        - the most recent *just closed* candle
-        """
-        if timeframe not in self.TIMEFRAMES:
-            return 0, []
-
-        interval = self.TIMEFRAMES[timeframe]["interval"]
-        now = int(datetime.now().timestamp())
-
-        df_sorted = df.sort_values("timestamp")
-        # Anything more than one interval ahead is "suspicious"
-        future_mask = df_sorted["timestamp"] > (now + interval)
-        future_ts = df_sorted.loc[future_mask, "timestamp"]
-
-        count = int(future_ts.shape[0])
-        examples = future_ts.head(5).tolist()
-
-        if count > 0:
-            self.errors.append(
-                f"{file_name}: {count} candles appear to be in the future "
-                f"(relative to now={now}). Examples: {examples}"
-            )
-
-        return count, examples
-
-    # ------------------------------------------------------------------ #
-    # Per-file validation
-    # ------------------------------------------------------------------ #
-
-    def validate_file(self, file_path: Path) -> Dict:
-        """Comprehensive validation of a single parquet file."""
-        print(f"\n{'=' * 80}")
-        print(f"Validating: {file_path.name}")
-        print(f"{'=' * 80}")
-
-        # Parse filename (e.g., BTCUSDT_1m_2025-11-30.parquet)
-        parts = file_path.stem.split("_")
-        if len(parts) < 3:
-            self.errors.append(f"{file_path.name}: Invalid filename format")
-            return {}
-
-        symbol = parts[0]
-        timeframe = parts[1]
-        date = parts[2]
-
-        # Basic structure validation
-        structure = self.validate_file_structure(file_path)
-        print("\n📄 File Structure:")
-        print(f"   Size: {structure['size_mb']} MB")
-        print(f"   Rows: {structure['row_count']:,}")
-        print(f"   Columns OK: {'✓' if structure['columns_ok'] else '✗'}")
-
-        if not structure["readable"] or not structure["columns_ok"]:
-            return structure
-
-        # Load data
-        df = pd.read_parquet(file_path)
-
-        # Ordering
-        print("\n🔢 Timestamp Ordering:")
-        is_sorted = self.check_ordering(df, file_path.name)
-        print(f"   Ascending order: {'✓' if is_sorted else '✗ FAILED'}")
-
-        # Duplicates
-        print("\n🔍 Duplicate Check:")
-        dup_count = self.check_duplicates(df, file_path.name)
-        if dup_count == 0:
-            print("   No duplicates: ✓")
-        else:
-            print(f"   Duplicates found: ✗ {dup_count}")
-
-        # Gaps
-        print("\n⛓️  Gap Analysis:")
-        gap_count, gap_details = self.check_gaps(df, timeframe, file_path.name)
-        if gap_count == 0:
-            print("   No gaps: ✓")
-        else:
-            print(f"   Gaps found: ✗ {gap_count}")
-            for i, gap in enumerate(gap_details[:5], 1):
-                print(f"   Gap {i}: {gap['prev_time']} -> {gap['next_time']}")
-                print(
-                    f"          Missing {gap['missing_candles']} candles "
-                    f"({gap['missing_seconds']}s)"
+    def check_field_mismatch(self, df: pd.DataFrame, file: str):
+        if "open_ts" in df.columns:
+            mismatch = df[df["open_ts"] != df["timestamp"]]
+            if len(mismatch) > 0:
+                vals = mismatch["timestamp"].head(5).tolist()
+                self.errors.append(
+                    f"{file}: {len(mismatch)} rows where open_ts != timestamp → {vals}"
                 )
-            if len(gap_details) > 5:
-                print(f"   ... and {len(gap_details) - 5} more gaps")
+                return len(mismatch)
+        return 0
 
-        # Alignment (open-time semantics)
-        print("\n📏 Timestamp Alignment:")
-        misaligned_count, misaligned_examples = self.check_alignment(
-            df, timeframe, file_path.name
-        )
-        if misaligned_count == 0:
-            print("   All timestamps correctly aligned: ✓")
-        else:
-            print(f"   Misaligned timestamps: ✗ {misaligned_count}")
-            print(f"   Examples: {misaligned_examples}")
+    # ----------------------------------------------------------------------
+    # Main file validator
+    # ----------------------------------------------------------------------
 
-        # Future timestamps
-        print("\n⏩ Future Timestamp Check:")
-        future_count, future_examples = self.check_future_timestamps(
-            df, timeframe, file_path.name
-        )
-        if future_count == 0:
-            print("   No future candles: ✓")
-        else:
-            print(f"   Candles in the future: ✗ {future_count}")
-            print(f"   Examples: {future_examples}")
+    def validate_file(self, fp: Path):
+        print("\n" + "=" * 80)
+        print(f"Validating: {fp.name}")
+        print("=" * 80)
 
-        # OHLCV integrity
-        print("\n💹 OHLCV Integrity:")
-        ohlcv_issues = self.check_ohlcv_integrity(df, file_path.name)
-        all_good_ohlcv = all(count == 0 for count in ohlcv_issues.values())
-        if all_good_ohlcv:
-            print("   All checks passed: ✓")
-        else:
-            for issue, count in ohlcv_issues.items():
-                if count > 0:
-                    print(f"   {issue}: ✗ {count} violations")
-
-        # Time range
-        print("\n⏰ Time Range:")
-        time_info = self.check_time_range(df, timeframe)
-        print(f"   First candle: {time_info['first_candle']}")
-        print(f"   Last candle:  {time_info['last_candle']}")
-        print(f"   Duration:     {time_info['duration_hours']} hours")
-        print(f"   Expected:     {time_info['expected_count']:,} candles")
-        print(f"   Actual:       {time_info['actual_count']:,} candles")
-        print(f"   Coverage:     {time_info['coverage_pct']}%")
-
-        # Summary result for this file
-        result = {
-            "file": file_path.name,
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "date": date,
-            "size_mb": structure["size_mb"],
-            "candles": structure["row_count"],
-            "expected": time_info["expected_count"],
-            "coverage": time_info["coverage_pct"],
-            "gaps": gap_count,
-            "duplicates": dup_count,
-            "ordered": is_sorted,
-            "ohlcv_ok": all_good_ohlcv,
-            "alignment_ok": misaligned_count == 0,
-            "future_ok": future_count == 0,
-            "first_candle": time_info["first_candle"],
-            "last_candle": time_info["last_candle"],
-        }
-
-        return result
-
-    # ------------------------------------------------------------------ #
-    # Bulk validation
-    # ------------------------------------------------------------------ #
-
-    def validate_all(
-        self,
-        symbol: Optional[str] = None,
-        date_str: Optional[str] = None,
-    ) -> None:
-        """Validate all matching parquet files."""
-        files = self.find_parquet_files(symbol, date_str)
-
-        if not files:
-            print(f"❌ No parquet files found in {self.data_dir}")
-            if symbol:
-                print(f"   Symbol filter: {symbol}")
-            if date_str:
-                print(f"   Date filter: {date_str}")
+        # Extract metadata
+        parts = fp.stem.split("_")
+        if len(parts) < 3:
+            self.errors.append(f"{fp.name}: Invalid filename format")
             return
 
-        print(f"\n{'=' * 80}")
-        print("PARQUET FILE VALIDATION REPORT")
-        print(f"{'=' * 80}")
-        print(f"Directory: {self.data_dir.absolute()}")
-        print(f"Files found: {len(files)}")
-        print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        symbol, tf, date = parts[0], parts[1], parts[2]
 
-        for file_path in files:
-            result = self.validate_file(file_path)
-            if result:
-                self.results.append(result)
+        df, meta = self.validate_structure(fp)
+        if df is None:
+            return
 
-        # Summary table
-        if self.results:
-            print(f"\n{'=' * 80}")
-            print("SUMMARY TABLE")
-            print(f"{'=' * 80}\n")
+        print(f"\n📄 Structure: {meta['size_mb']} MB, {meta['row_count']} rows")
+        if meta["missing_cols"]:
+            print(f"❌ Missing columns → {meta['missing_cols']}")
+            return
 
-            table_data = []
-            for r in self.results:
-                status_ok = (
-                    r["gaps"] == 0
-                    and r["duplicates"] == 0
-                    and r["ordered"]
-                    and r["ohlcv_ok"]
-                    and r["alignment_ok"]
-                    and r["future_ok"]
-                )
-                status = "✓" if status_ok else "✗"
+        # Canonical timestamp
+        ts = self.resolve_timestamp(df)
 
-                table_data.append(
-                    [
-                        status,
-                        r["symbol"],
-                        r["timeframe"],
-                        f"{r['candles']:,}",
-                        f"{r['expected']:,}",
-                        f"{r['coverage']:.1f}%",
-                        r["gaps"],
-                        r["duplicates"],
-                        "✓" if r["ordered"] else "✗",
-                        "✓" if r["alignment_ok"] else "✗",
-                        "✓" if r["ohlcv_ok"] else "✗",
-                    ]
-                )
+        # Ordering
+        print("\n🔢 Ordering:")
+        ordered = self.check_order(ts, fp.name)
+        print(f"   Sorted → {'YES' if ordered else 'NO'}")
 
-            headers = [
-                "OK",
-                "Symbol",
-                "TF",
-                "Candles",
-                "Expected",
-                "Coverage",
-                "Gaps",
-                "Dups",
-                "Ordered",
-                "Aligned",
-                "OHLCV",
-            ]
-            print(tabulate(table_data, headers=headers, tablefmt="grid"))
+        # Duplicates
+        print("\n🔍 Duplicates:")
+        dup = self.check_duplicates(ts, fp.name)
+        print(f"   Duplicates → {dup}")
 
-        # Errors / warnings
+        # Gaps
+        print("\n⛓️  Gaps:")
+        gaps, gap_details = self.check_gaps(ts, tf, fp.name)
+        print(f"   Gaps → {gaps}")
+
+        # Alignment
+        print("\n📏 Alignment:")
+        misaligned, examples = self.check_alignment(ts, tf, fp.name)
+        print(f"   Misaligned → {misaligned}")
+
+        # Future timestamps
+        print("\n⏩ Future:")
+        fut, fut_ex = self.check_future(ts, tf, fp.name)
+        print(f"   Future → {fut}")
+
+        # OHLCV
+        print("\n💹 OHLCV:")
+        ohlcv = self.check_ohlcv(df, fp.name)
+        print(f"   Issues → {ohlcv}")
+
+        # open_ts vs timestamp mismatch
+        print("\n⚠️  Field Mismatch:")
+        mismatch_count = self.check_field_mismatch(df, fp.name)
+        print(f"   open_ts != timestamp → {mismatch_count}")
+
+        # Summary
+        self.results.append(
+            {
+                "file": fp.name,
+                "symbol": symbol,
+                "tf": tf,
+                "rows": len(df),
+                "gaps": gaps,
+                "dups": dup,
+                "misaligned": misaligned,
+                "future": fut,
+                "ohlcv_ok": all(v == 0 for v in ohlcv.values()),
+                "ordered": ordered,
+                "mismatch": mismatch_count,
+            }
+        )
+
+    # ----------------------------------------------------------------------
+    # Validate all files
+    # ----------------------------------------------------------------------
+
+    def run(self, symbol=None, date=None):
+        files = self.find_files(symbol, date)
+
+        if not files:
+            print(f"No files found in {self.dir}")
+            return
+
+        print("=" * 80)
+        print("PARQUET VALIDATION REPORT")
+        print("=" * 80)
+
+        for fp in files:
+            self.validate_file(fp)
+
+        print("\n" + "=" * 80)
+        print("SUMMARY")
+        print("=" * 80)
+
+        if not self.results:
+            print("Nothing validated.")
+            return
+
+        rows = []
+        for r in self.results:
+            ok = (
+                r["gaps"] == 0
+                and r["dups"] == 0
+                and r["misaligned"] == 0
+                and r["future"] == 0
+                and r["ohlcv_ok"]
+                and r["ordered"]
+                and r["mismatch"] == 0
+            )
+
+            rows.append(
+                [
+                    "✓" if ok else "✗",
+                    r["file"],
+                    r["symbol"],
+                    r["tf"],
+                    r["rows"],
+                    r["gaps"],
+                    r["dups"],
+                    r["misaligned"],
+                    r["future"],
+                    "YES" if r["ohlcv_ok"] else "NO",
+                    "YES" if r["ordered"] else "NO",
+                    r["mismatch"],
+                ]
+            )
+
+        headers = [
+            "OK",
+            "File",
+            "Symbol",
+            "TF",
+            "Rows",
+            "Gaps",
+            "Dups",
+            "Misaligned",
+            "Future",
+            "OHLCV",
+            "Ordered",
+            "Mismatch",
+        ]
+
+        print(tabulate(rows, headers=headers, tablefmt="grid"))
+
+        # Error dump
         if self.errors:
-            print(f"\n{'=' * 80}")
-            print(f"❌ ERRORS ({len(self.errors)})")
-            print(f"{'=' * 80}")
-            for error in self.errors:
-                print(f"  • {error}")
-
-        if self.warnings:
-            print(f"\n{'=' * 80}")
-            print(f"⚠️  WARNINGS ({len(self.warnings)})")
-            print(f"{'=' * 80}")
-            for warning in self.warnings:
-                print(f"  • {warning}")
-
-        print(f"\n{'=' * 80}")
-        if not self.errors and not self.warnings:
-            print("✅ ALL VALIDATIONS PASSED!")
-        elif not self.errors:
-            print("⚠️  VALIDATION COMPLETED WITH WARNINGS")
-        else:
-            print("❌ VALIDATION FAILED - ISSUES FOUND")
-        print(f"{'=' * 80}\n")
+            print("\nERRORS:")
+            for e in self.errors:
+                print(" •", e)
 
 
-def main() -> None:
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="Validate trading bot parquet files",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python validate_parquet.py
-  python validate_parquet.py --dir data/live
-  python validate_parquet.py --symbol BTCUSDT
-  python validate_parquet.py --symbol BTCUSDT --date 2025-11-30
-        """,
-    )
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--dir", default="data/live")
+    p.add_argument("--symbol")
+    p.add_argument("--date")
+    args = p.parse_args()
 
-    parser.add_argument(
-        "--dir",
-        default="data/live",
-        help="Data directory containing parquet files (default: data/live)",
-    )
-    parser.add_argument(
-        "--symbol",
-        help="Filter by symbol (e.g., BTCUSDT)",
-    )
-    parser.add_argument(
-        "--date",
-        help="Filter by date (e.g., 2025-11-30)",
-    )
+    v = ParquetValidator(args.dir)
+    v.run(args.symbol, args.date)
 
-    args = parser.parse_args()
-
-    validator = ParquetValidator(args.dir)
-    validator.validate_all(args.symbol, args.date)
-
-    # Exit with error code if issues found
-    sys.exit(1 if validator.errors else 0)
+    sys.exit(1 if v.errors else 0)
 
 
 if __name__ == "__main__":

@@ -2,10 +2,12 @@
 InitialCandlesLoader:
 - Loads historical candles from REST
 - Injects them into CandleManager
-- Updates CandleSync last timestamp
+- Updates CandleSync last timestamp (open_ts of last CLOSED candle)
 - Optionally builds initial LiquidityMap
 """
 
+import time
+from datetime import datetime
 from typing import Dict, List, Any, Optional
 
 from trading_bot.core.logger import get_logger
@@ -32,29 +34,22 @@ class InitialCandlesLoader:
     # -------------------------------------------------------------------------
     # MAIN ENTRY POINT
     # -------------------------------------------------------------------------
+
     def load_initial_for_symbol(
         self,
         symbol_cfg: SymbolConfig,
-        candle_managers: Dict[str, CandleManager],   # {"1m": CandleManager, ...}
-        candle_syncs: Dict[str, CandleSync],         # {"1m": CandleSync, ...}
+        candle_managers: Dict[str, CandleManager],  # {"1m": CandleManager, ...}
+        candle_syncs: Dict[str, CandleSync],        # {"1m": CandleSync, ...}
         liquidity_maps: Optional[Dict[str, Any]] = None,  # Dict of LiquidityMap per TF
         storage=None,  # ParquetStorage for async writes
     ) -> bool:
         """
         Loads and seeds all structures for a single symbol.
 
-        Args:
-            symbol_cfg      → includes name + TF configs
-            candle_managers → CandleManager per timeframe
-            candle_syncs    → CandleSync per timeframe
-            liquidity_maps  → Dict of LiquidityMap instances (one per TF)
-            storage         → ParquetStorage or similar (optional)
-
         Returns:
             True if at least one timeframe was successfully initialized,
             False if all timeframes failed.
         """
-
         symbol = symbol_cfg.name
         self.logger.info(f"[InitialLoad] Start for {symbol}")
 
@@ -62,19 +57,17 @@ class InitialCandlesLoader:
 
         for tf_cfg in symbol_cfg.timeframes:
             tf = tf_cfg.tf
-            fetch = tf_cfg.fetch
 
             cm = candle_managers.get(tf)
             sync = candle_syncs.get(tf)
 
             if cm is None or sync is None:
                 self.logger.error(
-                    f"[InitialLoad] Missing CandleManager or CandleSync "
-                    f"for {symbol} {tf}"
+                    f"[InitialLoad] Missing CandleManager or CandleSync for {symbol} {tf}"
                 )
                 continue
 
-            # 1️⃣ Fetch REST candles (only closed)
+            # 1️⃣ Fetch REST candles (only closed, via end_time logic)
             candles = self._fetch_candles(symbol, tf_cfg)
 
             if not candles:
@@ -83,9 +76,14 @@ class InitialCandlesLoader:
                 )
                 continue
 
-            # (Optional) simple alignment sanity check
+            # Simple alignment sanity check using open_ts/ts
             tf_seconds = self.rest_client.app_config.get_timeframe_seconds(tf)
-            aligned = [c for c in candles if (c["ts"] - candles[0]["ts"]) % tf_seconds == 0]
+            base_ts = candles[0]["open_ts"]
+            aligned = [
+                c for c in candles
+                if (c["open_ts"] - base_ts) % tf_seconds == 0
+            ]
+
             if len(aligned) != len(candles):
                 self.logger.warning(
                     f"[InitialLoad] Alignment issue for {symbol} {tf}: "
@@ -93,24 +91,21 @@ class InitialCandlesLoader:
                 )
             else:
                 self.logger.debug(
-                    f"[InitialLoad] Alignment OK for {symbol} {tf}: "
-                    f"{len(aligned)} candles"
+                    f"[InitialLoad] Alignment OK for {symbol} {tf}: {len(aligned)} candles"
                 )
 
-            # Use aligned subset (conservative)
             candles = aligned
-
             if not candles:
                 self.logger.error(
                     f"[InitialLoad] All candles misaligned for {symbol} {tf}"
                 )
                 continue
 
-            # 2️⃣ Load into CandleManager
+            # 2️⃣ Load into CandleManager (oldest → newest)
             cm.load_initial(candles)
 
-            # 3️⃣ Set last closed timestamp for CandleSync
-            last_ts = cm.last_timestamp()
+            # 3️⃣ Set last CLOSED candle OPEN timestamp for CandleSync
+            last_ts = cm.last_open_time()
             sync.set_initial_last_ts(last_ts)
 
             # 4️⃣ Save to Parquet storage (async)
@@ -147,10 +142,8 @@ class InitialCandlesLoader:
                     )
 
             self.logger.info(
-                f"[InitialLoad] {symbol} {tf}: "
-                f"loaded={len(candles)} last_ts={last_ts}"
+                f"[InitialLoad] {symbol} {tf}: loaded={len(candles)} last_ts={last_ts}"
             )
-
             success_count += 1
 
         if success_count == 0:
@@ -159,41 +152,37 @@ class InitialCandlesLoader:
             )
             return False
 
-        self.logger.info(f"[InitialLoad] Completed for {symbol}, "
-                         f"timeframes_ok={success_count}")
+        self.logger.info(
+            f"[InitialLoad] Completed for {symbol}, timeframes_ok={success_count}"
+        )
         return True
 
     # -------------------------------------------------------------------------
     # REST FETCHER (Using RestClient)
     # -------------------------------------------------------------------------
+
     def _fetch_candles(self, symbol: str, tf_cfg: TimeframeConfig) -> List[Dict[str, Any]]:
         """
         Fetch candles from Binance REST using RestClient.
 
-        Args:
-            symbol: Trading pair (e.g., "BTCUSDT")
-            tf_cfg: Timeframe configuration with tf and fetch limit
-
-        Returns:
-            List of normalized candle dictionaries
+        We ALWAYS fetch only fully CLOSED candles, by setting end_time
+        to the last fully completed candle's CLOSE time.
         """
-        import time
-        from datetime import datetime
-
-        current_time = int(time.time())
         tf_seconds = self.rest_client.app_config.get_timeframe_seconds(tf_cfg.tf)
+        now_sec = int(time.time())
 
-        # Round down to last complete candle close time:
-        # e.g., for 1m, if now is 12:05:10, last_closed = 12:05:00
-        last_closed_open_ts = (current_time // tf_seconds) * tf_seconds
-        # Candle close time (seconds) is last_closed_open_ts - 1
-        last_closed_close_ts = last_closed_open_ts - 1
+        # Last fully CLOSED candle has:
+        #   open_ts = floor(now / tf) * tf - tf
+        #   close_ts = open_ts + tf - 1
+        last_closed_open_ts = (now_sec // tf_seconds) * tf_seconds - tf_seconds
+        last_closed_close_ts = last_closed_open_ts + tf_seconds - 1
 
         end_time_ms = last_closed_close_ts * 1000
 
         self.logger.info(
             f"[InitialLoad] Fetching {tf_cfg.fetch} candles for {symbol} {tf_cfg.tf} "
-            f"(end_time={datetime.fromtimestamp(last_closed_close_ts)})"
+            f"(last_closed_open_ts={last_closed_open_ts}, "
+            f"close_time={datetime.fromtimestamp(last_closed_close_ts)})"
         )
 
         candles = self.rest_client.fetch_klines(

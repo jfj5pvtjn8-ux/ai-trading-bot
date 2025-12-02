@@ -316,7 +316,7 @@ class TradingBot:
         """
         self.logger.info(
             f"[VALIDATED] {symbol} {timeframe} "
-            f"ts={candle['ts']} close={candle['close']} vol={candle['volume']}"
+            f"open_ts={candle['ts']} close={candle['close']} vol={candle['volume']}"
         )
         # TODO:
         # - LiquidityMap.on_candle(...)
@@ -379,7 +379,7 @@ class TradingBot:
                 last_ts = last_c["ts"] if last_c else None
                 self.logger.info(
                     f"  {tf}: {data['candle_count']} candles, "
-                    f"last_ts={last_ts}, close={close_val}"
+                    f"last_open_ts={last_ts}, close={close_val}"
                 )
 
     # -------------------------------------------------------------------------

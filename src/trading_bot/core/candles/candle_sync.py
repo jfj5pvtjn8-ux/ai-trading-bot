@@ -1,3 +1,7 @@
+# =====================================================================================
+# CandleSync with Optimized Batch Gap Filling
+# =====================================================================================
+
 from typing import Optional, Dict, Any, Callable
 from trading_bot.core.logger import get_logger
 from trading_bot.config.app.models import AppConfig
@@ -7,9 +11,8 @@ class CandleSync:
     """
     Ensures closed candles are:
       - Sequential
-      - Gap-filled when needed
-      - Using OPEN TIMESTAMPS (t divisible by timeframe)
-      - Synchronized across TFs
+      - Using open timestamps (ts divisible by timeframe)
+      - Gap-filled efficiently using batch REST calls
       - Forwarded to CandleManager + Strategy Layer
     """
 
@@ -22,17 +25,16 @@ class CandleSync:
         app_config: AppConfig,
     ):
         self.logger = get_logger(__name__)
-
         self.rest = rest_client
         self.symbol = symbol
         self.tf = timeframe
         self.cm = candle_manager
         self.app_config = app_config
 
-        # timeframe step in seconds
+        # TF step in seconds
         self.step = self.app_config.get_timeframe_seconds(timeframe)
 
-        # We store OPEN timestamp, not CLOSE timestamp.
+        # Last known OPEN timestamp
         self.last_open_ts: Optional[int] = None
 
         # callback(symbol, timeframe, candle)
@@ -47,18 +49,16 @@ class CandleSync:
         self.last_open_ts = last_ts
         self.logger.info(f"[CandleSync] Seed ts={last_ts} for {self.symbol} {self.tf}")
 
-    def set_callback(self, fn: Callable[[str, str, Dict[str, Any]], Any]):
+    def set_callback(self, fn):
         self.callback = fn
 
     # -------------------------------------------------------------------------
-    # ENTRY: CLOSED CANDLE FROM WEBSOCKET
+    # ENTRY: Closed candle from WebSocket
     # -------------------------------------------------------------------------
 
     def on_ws_closed_candle(self, candle: Dict[str, Any], storage=None):
         """
-        WS candle dict MUST contain:
-            {"open_ts": int, ...}
-        Not close timestamp!
+        WS candle dict MUST contain: {"open_ts": int, ...}
         """
 
         incoming_open_ts = candle["open_ts"]
@@ -70,7 +70,7 @@ class CandleSync:
 
         expected = self.last_open_ts + self.step
 
-        # Duplicate / old
+        # Duplicate / out-of-order
         if incoming_open_ts <= self.last_open_ts:
             return
 
@@ -79,14 +79,14 @@ class CandleSync:
             self._accept(candle, storage)
             return
 
-        # Missing gaps — fetch via REST
+        # Missing gap(s) → batch recovery
         if incoming_open_ts > expected:
-            self._fill_missing(expected, incoming_open_ts)
+            self._fill_missing_batch(expected, incoming_open_ts, storage)
             self._accept(candle, storage)
             return
 
     # -------------------------------------------------------------------------
-    # ACCEPT VALID CANDLE
+    # ACCEPT A SINGLE CANDLE
     # -------------------------------------------------------------------------
 
     def _accept(self, candle: Dict[str, Any], storage=None):
@@ -100,63 +100,68 @@ class CandleSync:
             try:
                 self.callback(self.symbol, self.tf, candle)
             except Exception as e:
-                self.logger.error(f"Candle callback error {self.symbol} {self.tf}: {e}")
+                self.logger.error(f"CandleSync callback error {self.symbol} {self.tf}: {e}")
 
     # -------------------------------------------------------------------------
-    # GAP FILLING
+    # BATCH GAP FILLER (Optimized — PRODUCTION READY)
     # -------------------------------------------------------------------------
 
-    def _fill_missing(self, start_ts: int, incoming_ts: int):
+    def _fill_missing_batch(self, start_ts: int, incoming_ts: int, storage=None):
         """
-        If we expected ts=X but WS gives ts=Y, fetch missing candles:
-        X, X+step, X+2step ... until Y-step.
+        Fill missing candles between start_ts (expected) and incoming_ts (WS open_ts).
+        
+        Example:
+            expected=10:00 open_ts
+            incoming=10:07 open_ts
+            Missing: 10:01 ... 10:06
+
+        Fetch ALL missing candles in ONE REST CALL.
         """
+
+        missing_count = (incoming_ts - start_ts) // self.step
+
         self.logger.warning(
-            f"[CandleSync] Missing candles for {self.symbol} {self.tf} "
-            f"from {start_ts} to {incoming_ts - self.step}"
+            f"[CandleSync] Missing {missing_count} candles for "
+            f"{self.symbol} {self.tf} ({start_ts} → {incoming_ts - self.step})"
         )
 
-        ts = start_ts
-
-        while ts < incoming_ts:
-            missing = self._fetch_exact_open_candle(ts)
-
-            if not missing:
-                self.logger.error(
-                    f"[CandleSync] Could not recover missing candle @ {ts}"
-                )
-                ts += self.step
-                continue
-
-            self._accept(missing)
-            ts += self.step
-
-    # -------------------------------------------------------------------------
-    # REST HELPERS
-    # -------------------------------------------------------------------------
-
-    def _fetch_exact_open_candle(self, open_ts: int) -> Optional[Dict[str, Any]]:
-        """
-        Fetch EXACT candle matching open timestamp.
-
-        - Start time = open_ts * 1000
-        - End time   = (open_ts + step) * 1000
-        """
-
+        # REST batch fetch
         batch = self.rest.fetch_klines(
             symbol=self.symbol,
             timeframe=self.tf,
-            limit=2,
-            start_time=open_ts * 1000,
-            end_time=(open_ts + self.step) * 1000,
+            limit=missing_count,
+            start_time=start_ts * 1000,
+            end_time=(incoming_ts * 1000),
         )
 
         if not batch:
-            return None
+            self.logger.error(
+                f"[CandleSync] REST returned empty batch for {self.symbol} {self.tf}"
+            )
+            return
 
-        # Find candle by open timestamp match
-        for c in batch:
-            if c["open_ts"] == open_ts:
-                return c
+        # Build lookup map by open timestamp
+        lookup = {c["open_ts"]: c for c in batch}
 
-        return None
+        # Sequential acceptance
+        ts = start_ts
+        recovered = 0
+
+        while ts < incoming_ts:
+            c = lookup.get(ts)
+
+            if not c:
+                # REST missed something — rare but possible
+                self.logger.error(
+                    f"[CandleSync] Missing candle {ts} even after batch fetch"
+                )
+            else:
+                self._accept(c, storage)
+                recovered += 1
+
+            ts += self.step
+
+        self.logger.info(
+            f"[CandleSync] Batch gap recovery complete for "
+            f"{self.symbol} {self.tf}: recovered={recovered}/{missing_count}"
+        )
