@@ -144,9 +144,17 @@ class ParquetStorage:
                 # Append to existing file or create new
                 if filepath.exists():
                     df_existing = pd.read_parquet(filepath)
+                    
+                    # Check if this timestamp already exists
+                    new_ts = df_new["timestamp"].iloc[0]
+                    if new_ts in df_existing["timestamp"].values:
+                        return  # Skip duplicate
+                    
                     df_combined = pd.concat(
                         [df_existing, df_new], ignore_index=True
                     )
+                    # Sort by timestamp to maintain order
+                    df_combined = df_combined.sort_values("timestamp").reset_index(drop=True)
                     df_combined.to_parquet(
                         filepath, index=False, compression="snappy"
                     )
@@ -218,9 +226,22 @@ class ParquetStorage:
                 # Append to existing file or create new
                 if filepath.exists():
                     df_existing = pd.read_parquet(filepath)
+                    
+                    # Filter out timestamps that already exist
+                    existing_timestamps = set(df_existing["timestamp"].values)
+                    df_new = df_new[~df_new["timestamp"].isin(existing_timestamps)]
+                    
+                    if df_new.empty:
+                        self.logger.debug(
+                            f"[ParquetStorage] All {len(candles)} candles already exist in {filename}"
+                        )
+                        return
+                    
                     df_combined = pd.concat(
                         [df_existing, df_new], ignore_index=True
                     )
+                    # Sort by timestamp to maintain order
+                    df_combined = df_combined.sort_values("timestamp").reset_index(drop=True)
                     df_combined.to_parquet(
                         filepath, index=False, compression="snappy"
                     )
@@ -233,7 +254,7 @@ class ParquetStorage:
                     )
 
                 self.logger.debug(
-                    f"[ParquetStorage] Batch saved {len(candles)} candles to {filename}"
+                    f"[ParquetStorage] Batch saved {len(df_new)} candles to {filename}"
                 )
 
         except Exception as e:
