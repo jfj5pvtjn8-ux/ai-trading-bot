@@ -33,6 +33,18 @@ class AppConfigValidator(BaseValidator):
         BaseValidator.validate_float(retry_delay, "candles.retry_delay", min_value=0, path=path)
 
     @staticmethod
+    def validate_duckdb_settings(obj: Dict[str, Any], path: Optional[str] = None) -> None:
+        BaseValidator.validate_dict(obj, "duckdb", path)
+        
+        initial_candles = obj.get("initial_candles", {})
+        BaseValidator.validate_dict(initial_candles, "duckdb.initial_candles", path)
+        
+        # Validate each timeframe has positive integer value
+        for tf, count in initial_candles.items():
+            BaseValidator.validate_string(tf, "duckdb.initial_candles key", path=path)
+            BaseValidator.validate_int(count, f"duckdb.initial_candles[{tf}]", min_value=1, path=path)
+
+    @staticmethod
     def validate_exchange_settings(obj: Dict[str, Any], path: Optional[str] = None) -> None:
         BaseValidator.validate_dict(obj, "exchange", path)
         
@@ -74,6 +86,13 @@ class AppConfigValidator(BaseValidator):
         AppConfigValidator.validate_candle_settings(
             candles, path=f"{base}.candles" if base else "candles"
         )
+        
+        # Validate duckdb section (optional)
+        duckdb = obj.get("duckdb", {})
+        if duckdb:
+            AppConfigValidator.validate_duckdb_settings(
+                duckdb, path=f"{base}.duckdb" if base else "duckdb"
+            )
         
         # Validate exchange section
         exchange = obj.get("exchange", {})

@@ -46,6 +46,26 @@ class CandleSettings:
 
 
 @dataclass(frozen=True)
+class DuckDBSettings:
+    """DuckDB initial candles configuration."""
+    initial_candles: Dict[str, int] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, obj: Dict[str, Any]) -> "DuckDBSettings":
+        AppConfigValidator.validate_duckdb_settings(obj)
+        return cls(
+            initial_candles=obj.get("initial_candles", {})
+        )
+
+    def get_initial_candles(self, timeframe: str, default: int = 1000) -> int:
+        """Get number of initial candles to load for a timeframe."""
+        return self.initial_candles.get(timeframe, default)
+
+    def __repr__(self) -> str:
+        return f"DuckDBSettings(initial_candles={self.initial_candles})"
+
+
+@dataclass(frozen=True)
 class ExchangeSettings:
     """Exchange API settings."""
     name: str
@@ -73,6 +93,7 @@ class AppConfig:
     app: AppInfo
     timeframe_intervals: Dict[str, int] = field(default_factory=dict)
     candles: CandleSettings = field(default_factory=CandleSettings)
+    duckdb: DuckDBSettings = field(default_factory=DuckDBSettings)
     exchange: ExchangeSettings = field(default_factory=ExchangeSettings)
 
     @classmethod
@@ -82,12 +103,14 @@ class AppConfig:
         app_info = AppInfo.from_dict(obj.get("app", {}))
         timeframe_intervals = obj.get("timeframe_intervals", {})
         candles = CandleSettings.from_dict(obj.get("candles", {}))
+        duckdb = DuckDBSettings.from_dict(obj.get("duckdb", {}))
         exchange = ExchangeSettings.from_dict(obj.get("exchange", {}))
         
         return cls(
             app=app_info,
             timeframe_intervals=timeframe_intervals,
             candles=candles,
+            duckdb=duckdb,
             exchange=exchange
         )
 
@@ -98,7 +121,7 @@ class AppConfig:
         return self.timeframe_intervals[timeframe]
 
     def __repr__(self) -> str:
-        return f"AppConfig(app={self.app!r}, timeframes={len(self.timeframe_intervals)}, candles={self.candles!r}, exchange={self.exchange!r})"
+        return f"AppConfig(app={self.app!r}, timeframes={len(self.timeframe_intervals)}, candles={self.candles!r}, duckdb={self.duckdb!r}, exchange={self.exchange!r})"
 
 
-__all__ = ["AppConfig", "AppInfo", "CandleSettings", "ExchangeSettings"]
+__all__ = ["AppConfig", "AppInfo", "CandleSettings", "DuckDBSettings", "ExchangeSettings"]

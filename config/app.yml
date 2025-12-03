@@ -16,6 +16,13 @@ candles:
   initial_retries: 3
   retry_delay: 0.5
 
+duckdb:
+  initial_candles:
+    1m: 10000
+    5m: 3000
+    15m: 2000
+    1h: 1000
+
 exchange:
   name: "binance"
   rest_endpoint: "https://api.binance.com/api/v3/klines"
