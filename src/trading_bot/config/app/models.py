@@ -47,13 +47,21 @@ class CandleSettings:
 
 @dataclass(frozen=True)
 class DuckDBSettings:
-    """DuckDB initial candles configuration."""
+    """DuckDB storage configuration."""
+    enabled: bool = True
+    database_path: str = "data/trading.duckdb"
+    fresh_start: bool = False
+    max_gap_hours: int = 168
     initial_candles: Dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, obj: Dict[str, Any]) -> "DuckDBSettings":
         AppConfigValidator.validate_duckdb_settings(obj)
         return cls(
+            enabled=obj.get("enabled", True),
+            database_path=obj.get("database_path", "data/trading.duckdb"),
+            fresh_start=obj.get("fresh_start", False),
+            max_gap_hours=obj.get("max_gap_hours", 168),
             initial_candles=obj.get("initial_candles", {})
         )
 
@@ -62,7 +70,7 @@ class DuckDBSettings:
         return self.initial_candles.get(timeframe, default)
 
     def __repr__(self) -> str:
-        return f"DuckDBSettings(initial_candles={self.initial_candles})"
+        return f"DuckDBSettings(enabled={self.enabled}, database_path={self.database_path!r}, fresh_start={self.fresh_start}, max_gap_hours={self.max_gap_hours}, initial_candles={self.initial_candles})"
 
 
 @dataclass(frozen=True)

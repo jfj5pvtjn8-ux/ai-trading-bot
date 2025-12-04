@@ -17,6 +17,10 @@ candles:
   retry_delay: 0.5
 
 duckdb:
+  enabled: true
+  database_path: "data/trading.duckdb"
+  fresh_start: true
+  max_gap_hours: 168
   initial_candles:
     1m: 10000
     5m: 3000

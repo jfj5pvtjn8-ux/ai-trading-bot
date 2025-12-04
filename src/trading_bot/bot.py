@@ -1,13 +1,13 @@
 """
-Trading Bot Orchestrator – Unified Candle Pipeline (Pro Edition)
+Trading Bot Orchestrator – Unified Candle Pipeline (DuckDB Edition)
 
 Wires together:
 - App + Symbols config
 - RestClient (Binance REST)
-- WebSocketClient (Binance WS, closed candles only)
+- DuckDBStorage (gap detection, backward filling, SQL analytics)
 - CandleManager (per symbol/timeframe, open-ts based)
 - CandleSync (gap-filling + validation)
-- ParquetStorage (async parquet writes)
+- WebSocketClient (Binance WS, closed candles only)
 - /health HTTP endpoint (Flask)
 """
 
@@ -29,20 +29,20 @@ from trading_bot.api.rest_client import RestClient
 from trading_bot.api.ws_client import WebSocketClient
 from trading_bot.core.candles.candle_manager import CandleManager
 from trading_bot.core.candles.candle_sync import CandleSync
-from trading_bot.core.candles.initial_candles_loader import InitialCandlesLoader
 from trading_bot.core.logger import get_logger, get_symbol_logger
-from trading_bot.storage.parquet_storage import ParquetStorage
+from trading_bot.storage.duckdb_storage import DuckDBStorage
 
 
 class TradingBot:
     """
     Main orchestrator for multi-symbol, multi-timeframe trading engine.
 
-    One CandleManager + CandleSync per (symbol, timeframe):
-
-        RestClient  → InitialCandlesLoader → CandleManager + CandleSync.seed()
-        WebSocket   → WebSocketClient      → CandleSync.on_ws_closed_candle()
-                    → CandleManager + ParquetStorage + Strategy Callback
+    Synchronous Startup Flow:
+        1. Initialize DuckDB (check last candles, backward fill gaps)
+        2. Create CandleManagers + CandleSync per (symbol, timeframe)
+        3. Load candles from DuckDB into sliding windows
+        4. Seed CandleSync with current state
+        5. Start WebSocket for real-time updates
     """
 
     def __init__(self) -> None:
@@ -55,7 +55,7 @@ class TradingBot:
         self.symbols_config = None
         self.rest_client: RestClient | None = None
         self.ws_client: WebSocketClient | None = None
-        self.storage: ParquetStorage | None = None
+        self.duckdb_storage: DuckDBStorage | None = None
 
         # key = (symbol, timeframe)
         self.candle_managers: Dict[Tuple[str, str], CandleManager] = {}
@@ -116,25 +116,9 @@ class TradingBot:
             return False
 
         # -------------------------------------------------
-        # Init Parquet storage
+        # REST client (needed for backward filling)
         # -------------------------------------------------
-        self.logger.info("\n[2/7] Initializing Parquet storage...")
-        try:
-            self.storage = ParquetStorage(
-                base_path=os.getenv("DATA_DIR", "data/live"),
-                retention_days=int(os.getenv("PARQUET_RETENTION_DAYS", "7")),
-                # usually True in dev, False in prod
-                fresh_start=os.getenv("PARQUET_FRESH_START", "true").lower() == "true",
-            )
-            self.logger.info("✓ Parquet storage initialized.")
-        except Exception as e:
-            self.logger.error(f"Parquet storage error: {e}")
-            return False
-
-        # -------------------------------------------------
-        # REST client
-        # -------------------------------------------------
-        self.logger.info("\n[3/7] Creating REST client...")
+        self.logger.info("\n[2/6] Creating REST client...")
         try:
             self.rest_client = RestClient(self.app_config)
             self.logger.info(
@@ -145,9 +129,15 @@ class TradingBot:
             return False
 
         # -------------------------------------------------
+        # Initialize DuckDB and fill gaps (SYNCHRONOUS)
+        # -------------------------------------------------
+        if not self._initialize_duckdb_storage():
+            return False
+
+        # -------------------------------------------------
         # Build CandleManager + CandleSync for each TF
         # -------------------------------------------------
-        self.logger.info("\n[4/7] Creating Candle Managers & Syncs...")
+        self.logger.info("\n[4/6] Creating Candle Managers & Syncs...")
         enabled_symbols = [s for s in self.symbols_config.symbols if s.enabled]
 
         for sym_cfg in enabled_symbols:
@@ -192,75 +182,20 @@ class TradingBot:
             return False
 
         # -------------------------------------------------
-        # Initial candles loading (parallel)
+        # Load candles from DuckDB into memory (SYNCHRONOUS)
         # -------------------------------------------------
-        self.logger.info("\n[5/7] Loading initial historical candles (parallel)...")
-        loader = InitialCandlesLoader(self.app_config, self.rest_client)
-
-        with ThreadPoolExecutor(max_workers=len(enabled_symbols)) as executor:
-            tasks: Dict[object, str] = {}
-
-            for sym_cfg in enabled_symbols:
-                symbol = sym_cfg.name
-
-                cm_dict = {
-                    tf_cfg.tf: self.candle_managers[(symbol, tf_cfg.tf)]
-                    for tf_cfg in sym_cfg.timeframes
-                }
-                sync_dict = {
-                    tf_cfg.tf: self.candle_syncs[(symbol, tf_cfg.tf)]
-                    for tf_cfg in sym_cfg.timeframes
-                }
-
-                fut = executor.submit(
-                    loader.load_initial_for_symbol,
-                    symbol_cfg=sym_cfg,
-                    candle_managers=cm_dict,
-                    candle_syncs=sync_dict,
-                    liquidity_maps=None,  # plug LM here later
-                    storage=self.storage,
-                )
-                tasks[fut] = symbol
-                self.logger.info(
-                    f"Submitted {symbol} for parallel initial load..."
-                )
-
-            for fut in as_completed(tasks):
-                symbol = tasks[fut]
-                try:
-                    ok = fut.result()
-                    if ok:
-                        self.logger.info(f"✓ {symbol}: initial load complete")
-                    else:
-                        self.logger.warning(
-                            f"{symbol}: initial load incomplete "
-                            f"(some TFs may have failed)"
-                        )
-                except Exception as e:
-                    self.logger.error(f"{symbol}: initial load error: {e}")
+        if not self._load_candles_into_memory():
+            return False
 
         # -------------------------------------------------
-        # Optional reverse gap recovery (backwards check)
+        # Seed CandleSync with current state
         # -------------------------------------------------
-        self.logger.info("\n[6/7] Optional reverse gap recovery...")
-        try:
-            for (symbol, tf), sync in self.candle_syncs.items():
-                try:
-                    sync.reverse_recovery(storage=self.storage)
-                except AttributeError:
-                    # If you don't use Pro CandleSync, this is a no-op
-                    continue
-                except Exception as e:
-                    self.logger.error(
-                        f"[ReverseRecovery] Error for {symbol} {tf}: {e}"
-                    )
-        except Exception as e:
-            self.logger.error(f"Reverse recovery phase error: {e}")
+        self._seed_candle_syncs()
 
         # -------------------------------------------------
         # Setup WebSocket client & subscriptions
         # -------------------------------------------------
-        self.logger.info("\n[7/7] Setting up WebSocket client & subscriptions...")
+        self.logger.info("\n[6/6] Setting up WebSocket client & subscriptions...")
         try:
             self.ws_client = WebSocketClient(self.app_config)
 
@@ -288,7 +223,7 @@ class TradingBot:
                             try:
                                 sync_obj = self.candle_syncs[km_key]
                                 sync_obj.on_ws_closed_candle(
-                                    candle, storage=self.storage
+                                    candle, storage=self.duckdb_storage
                                 )
                             except Exception as exc:
                                 self.logger.error(
@@ -314,6 +249,162 @@ class TradingBot:
         self._start_health_api()
         self.logger.info("\nInitialization COMPLETE ✅")
         return True
+
+    # -------------------------------------------------------------------------
+    # DUCKDB INITIALIZATION (SYNCHRONOUS)
+    # -------------------------------------------------------------------------
+
+    def _initialize_duckdb_storage(self) -> bool:
+        """Initialize DuckDB with gap detection and backward filling - SYNCHRONOUS."""
+        self.logger.info("\n[3/6] Initializing DuckDB storage...")
+        
+        try:
+            # Create DuckDB storage instance
+            db_path = self.app_config.duckdb.database_path
+            fresh_start = self.app_config.duckdb.fresh_start
+            
+            self.duckdb_storage = DuckDBStorage(
+                db_path=db_path,
+                app_config=self.app_config,
+                fresh_start=fresh_start
+            )
+            
+            # Initialize schema
+            self.duckdb_storage.initialize_schema()
+            
+            # If fresh start, clear all data
+            if fresh_start:
+                self.logger.info("[DuckDB] Fresh start mode - clearing all data")
+                self.duckdb_storage.clear_all_candles()
+            
+            # Process each symbol/timeframe SYNCHRONOUSLY
+            enabled_symbols = [s for s in self.symbols_config.symbols if s.enabled]
+            
+            for sym_cfg in enabled_symbols:
+                symbol = sym_cfg.name
+                
+                for tf_cfg in sym_cfg.timeframes:
+                    tf = tf_cfg.tf
+                    self.logger.info(f"\n[DuckDB] Processing {symbol} {tf}...")
+                    
+                    # Check last candle in DuckDB
+                    last_candle = self.duckdb_storage.get_last_candle(symbol, tf)
+                    
+                    if not last_candle or fresh_start:
+                        # No data or fresh start - load full history
+                        count = self.app_config.duckdb.get_initial_candles(tf)
+                        self.logger.info(f"  → Loading {count} candles from API...")
+                        
+                        success = self.duckdb_storage.backward_fill_gap(
+                            symbol, tf, self.rest_client, count
+                        )
+                        
+                        if not success:
+                            self.logger.error(f"  ✗ Failed to load candles for {symbol} {tf}")
+                            return False
+                    else:
+                        # Incremental - check for gap
+                        tf_seconds = self.app_config.get_timeframe_seconds(tf)
+                        gap_candles = self.duckdb_storage.calculate_gap(
+                            last_candle['open_ts'], tf_seconds
+                        )
+                        
+                        if gap_candles > 0:
+                            max_candles = self.app_config.duckdb.get_initial_candles(tf)
+                            
+                            if self.duckdb_storage.should_full_reload(gap_candles, max_candles):
+                                # Gap too large - full reload
+                                self.logger.warning(
+                                    f"  → Gap too large ({gap_candles} candles), "
+                                    f"performing full reload..."
+                                )
+                                self.duckdb_storage.delete_symbol_timeframe(symbol, tf)
+                                success = self.duckdb_storage.backward_fill_gap(
+                                    symbol, tf, self.rest_client, max_candles
+                                )
+                                
+                                if not success:
+                                    self.logger.error(f"  ✗ Failed to reload {symbol} {tf}")
+                                    return False
+                            else:
+                                # Normal gap fill
+                                self.logger.info(f"  → Filling {gap_candles} missing candles...")
+                                success = self.duckdb_storage.backward_fill_gap(
+                                    symbol, tf, self.rest_client, gap_candles
+                                )
+                                
+                                if not success:
+                                    self.logger.warning(f"  ⚠ Gap fill incomplete for {symbol} {tf}")
+                        else:
+                            self.logger.info(f"  ✓ No gap detected, data is current")
+            
+            # Log total candles in database
+            total_candles = self.duckdb_storage.get_candle_count()
+            self.logger.info(f"\n✓ DuckDB initialization complete ({total_candles} total candles)")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"[DuckDB] Initialization failed: {e}")
+            return False
+
+    def _load_candles_into_memory(self) -> bool:
+        """Load candles from DuckDB into CandleManager sliding windows - SYNCHRONOUS."""
+        self.logger.info("\n[5/6] Loading candles into memory (sliding windows)...")
+        
+        try:
+            enabled_symbols = [s for s in self.symbols_config.symbols if s.enabled]
+            
+            for sym_cfg in enabled_symbols:
+                symbol = sym_cfg.name
+                
+                for tf_cfg in sym_cfg.timeframes:
+                    tf = tf_cfg.tf
+                    key = (symbol, tf)
+                    
+                    # Fetch candles from DuckDB for sliding window
+                    window_size = tf_cfg.fetch  # From symbols.yml
+                    
+                    self.logger.info(f"  → Loading {window_size} candles for {symbol} {tf}...")
+                    candles = self.duckdb_storage.load_candles_for_window(
+                        symbol, tf, limit=window_size
+                    )
+                    
+                    if not candles:
+                        self.logger.warning(f"  ⚠ No candles found in DuckDB for {symbol} {tf}")
+                        continue
+                    
+                    # Add to CandleManager
+                    cm = self.candle_managers[key]
+                    for candle in candles:
+                        cm.add_candle(candle)
+                    
+                    self.logger.info(
+                        f"  ✓ Loaded {len(candles)} candles into memory for {symbol} {tf}"
+                    )
+            
+            self.logger.info("\n✓ All candles loaded into memory")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"[Memory Load] Failed: {e}")
+            return False
+
+    def _seed_candle_syncs(self) -> None:
+        """Seed CandleSync with current state - SYNCHRONOUS."""
+        self.logger.info("\n[5.5/6] Seeding CandleSync validators...")
+        
+        for (symbol, tf), sync in self.candle_syncs.items():
+            cm = self.candle_managers[(symbol, tf)]
+            latest = cm.get_latest_candle()
+            
+            if latest:
+                # Mark CandleSync as seeded with last timestamp
+                sync._last_validated_ts = latest['ts']
+                self.logger.info(
+                    f"  ✓ {symbol} {tf} seeded with ts={latest['ts']}"
+                )
+        
+        self.logger.info("\n✓ CandleSync validators seeded")
 
     # -------------------------------------------------------------------------
     # HEALTH ENDPOINT
@@ -374,6 +465,7 @@ class TradingBot:
         Called by CandleSync when a candle is fully validated & gap-filled.
 
         This is the hook point for:
+        - DuckDB storage (async write)
         - LiquidityMap.on_candle(...)
         - Strategy evaluation
         - Signal aggregation & execution
@@ -386,6 +478,10 @@ class TradingBot:
                 f"[VALIDATED] {symbol} {timeframe} "
                 f"ts={ts} close={close} vol={vol}"
             )
+
+            # Save to DuckDB (async write)
+            if self.duckdb_storage:
+                self.duckdb_storage.save_candle_async(symbol, timeframe, candle)
 
             # TODO:
             #   lm = self.liquidity_maps[timeframe]
@@ -484,12 +580,12 @@ class TradingBot:
             self.rest_client.close()
             self.logger.info("✓ REST client closed")
 
-        # Shutdown storage executor
-        if self.storage:
-            self.logger.info("Shutting down storage...")
+        # Shutdown DuckDB storage
+        if self.duckdb_storage:
+            self.logger.info("Shutting down DuckDB storage...")
             try:
-                self.storage.shutdown()
-                self.logger.info("✓ Storage shutdown complete")
+                self.duckdb_storage.shutdown()
+                self.logger.info("✓ DuckDB storage shutdown complete")
             except Exception as e:
                 self.logger.error(f"Error shutting down storage: {e}")
 

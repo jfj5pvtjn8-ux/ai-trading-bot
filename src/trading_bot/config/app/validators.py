@@ -36,6 +36,27 @@ class AppConfigValidator(BaseValidator):
     def validate_duckdb_settings(obj: Dict[str, Any], path: Optional[str] = None) -> None:
         BaseValidator.validate_dict(obj, "duckdb", path)
         
+        # Validate enabled flag
+        enabled = obj.get("enabled", True)
+        if not isinstance(enabled, bool):
+            ctx = f"{path}: " if path else ""
+            raise ConfigError(f"{ctx}duckdb.enabled must be a boolean")
+        
+        # Validate database_path
+        database_path = obj.get("database_path", "data/trading.duckdb")
+        BaseValidator.validate_string(database_path, "duckdb.database_path", path=path)
+        
+        # Validate fresh_start flag
+        fresh_start = obj.get("fresh_start", False)
+        if not isinstance(fresh_start, bool):
+            ctx = f"{path}: " if path else ""
+            raise ConfigError(f"{ctx}duckdb.fresh_start must be a boolean")
+        
+        # Validate max_gap_hours
+        max_gap_hours = obj.get("max_gap_hours", 168)
+        BaseValidator.validate_int(max_gap_hours, "duckdb.max_gap_hours", min_value=1, path=path)
+        
+        # Validate initial_candles
         initial_candles = obj.get("initial_candles", {})
         BaseValidator.validate_dict(initial_candles, "duckdb.initial_candles", path)
         

@@ -1,5 +1,5 @@
 """Storage package for candle data persistence."""
 
-from .parquet_storage import ParquetStorage
+from .duckdb_storage import DuckDBStorage
 
-__all__ = ["ParquetStorage"]
+__all__ = ["DuckDBStorage"]
