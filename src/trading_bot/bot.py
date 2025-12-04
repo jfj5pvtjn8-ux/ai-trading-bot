@@ -321,7 +321,8 @@ class TradingBot:
             
             if latest:
                 # Mark CandleSync as seeded with last timestamp
-                sync._last_validated_ts = latest['ts']
+                # FIXED: Use correct method instead of private attribute
+                sync.set_initial_last_ts(latest['ts'])
                 self.logger.info(
                     f"  ✓ {symbol} {tf} seeded with ts={latest['ts']}"
                 )

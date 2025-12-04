@@ -399,7 +399,7 @@ class DuckDBStorage:
         count: int
     ) -> bool:
         """
-        Fetch and insert missing candles backward from current time.
+        Fetch and insert missing candles from the gap period.
 
         Args:
             symbol: Trading pair
@@ -420,16 +420,40 @@ class DuckDBStorage:
             # Binance API expects timestamps in milliseconds
             import time as time_module
             
+            # Get timeframe in seconds
+            tf_map = {'1m': 60, '5m': 300, '15m': 900, '1h': 3600}
+            tf_seconds = tf_map.get(timeframe, 60)
+            
             all_candles = []
             
-            # Use fetch_klines which handles pagination automatically
-            # Pass end_time to trigger backward pagination from current time
-            batch = rest_client.fetch_klines(
-                symbol=symbol,
-                timeframe=timeframe,
-                limit=count,
-                end_time=int(time_module.time() * 1000)  # Current time in ms for backward pagination
-            )
+            # Get the last stored candle timestamp to know where to start filling
+            latest = self.get_last_candle(symbol, timeframe)
+            
+            if latest:
+                # Start from the next candle after the last stored one
+                # Add the timeframe interval to get the first missing candle timestamp
+                next_candle_ts = latest['ts'] + tf_seconds
+                start_time = next_candle_ts * 1000  # Convert to ms
+                
+                self.logger.info(
+                    f"[DuckDBStorage] Filling gap from ts={next_candle_ts} "
+                    f"({count} candles)"
+                )
+                
+                batch = rest_client.fetch_klines(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    limit=count + 5,  # Fetch a few extra to ensure we get all missing candles
+                    start_time=start_time  # Start from after last stored candle
+                )
+            else:
+                # No existing candles, fetch from current time backward
+                batch = rest_client.fetch_klines(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    limit=count,
+                    end_time=int(time_module.time() * 1000)
+                )
             
             if batch:
                 all_candles = batch
