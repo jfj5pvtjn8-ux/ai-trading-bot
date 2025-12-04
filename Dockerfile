@@ -11,8 +11,9 @@ COPY src/ src/
 # Install the package in editable mode
 RUN pip install -e .
 
-# Copy config and other files
+# Copy config, schema and other files
 COPY config/ config/
+COPY schema/ schema/
 COPY .env .env
 
 # Expose health check port

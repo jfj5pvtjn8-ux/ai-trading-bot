@@ -280,8 +280,8 @@ class DuckDBStorage:
                     """
                     INSERT INTO market.candles
                     (symbol, timeframe, open_ts, close_ts,
-                     open, high, low, close, volume, is_closed, source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     open, high, low, close, volume, is_closed, source, trading_day)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(to_timestamp(?) AS DATE))
                     ON CONFLICT (symbol, timeframe, open_ts) DO NOTHING
                     """,
                     [
@@ -295,7 +295,8 @@ class DuckDBStorage:
                         float(candle['close']),
                         float(candle['volume']),
                         True,  # is_closed
-                        'ws'   # source
+                        'ws',  # source
+                        open_ts  # for trading_day computation
                     ]
                 )
 
@@ -360,10 +361,17 @@ class DuckDBStorage:
 
             # Use DuckDB's efficient DataFrame insert
             with self.conn_lock:
-                # Insert with conflict resolution
+                # Insert with conflict resolution, computing trading_day from open_ts
                 self.conn.execute("""
                     INSERT INTO market.candles
-                    SELECT * FROM df
+                    (symbol, timeframe, open_ts, close_ts,
+                     open, high, low, close, volume,
+                     is_closed, source, received_at, trading_day)
+                    SELECT symbol, timeframe, open_ts, close_ts,
+                           open, high, low, close, volume,
+                           is_closed, source, CURRENT_TIMESTAMP,
+                           CAST(to_timestamp(open_ts) AS DATE)
+                    FROM df
                     ON CONFLICT (symbol, timeframe, open_ts) DO NOTHING
                 """)
 
@@ -408,44 +416,27 @@ class DuckDBStorage:
                 f"{symbol} {timeframe}..."
             )
 
-            # Fetch candles from REST API
-            # We'll fetch in batches if count > 1000 (Binance limit)
-            batch_size = 1000
+            # Fetch candles from REST API using pagination
+            # Binance API expects timestamps in milliseconds
+            import time as time_module
+            
             all_candles = []
-
-            remaining = count
-            while remaining > 0:
-                fetch_count = min(remaining, batch_size)
-
-                # Calculate end_time for this batch
-                if all_candles:
-                    # Use oldest candle's timestamp as end_time for next batch
-                    end_time = all_candles[-1]['ts'] - 1
-                else:
-                    # First batch - use current time
-                    end_time = None
-
-                # Fetch batch
-                batch = rest_client.fetch_klines(
-                    symbol=symbol,
-                    interval=timeframe,
-                    limit=fetch_count,
-                    end_time=end_time
+            
+            # Use fetch_klines which handles pagination automatically
+            # Pass end_time to trigger backward pagination from current time
+            batch = rest_client.fetch_klines(
+                symbol=symbol,
+                timeframe=timeframe,
+                limit=count,
+                end_time=int(time_module.time() * 1000)  # Current time in ms for backward pagination
+            )
+            
+            if batch:
+                all_candles = batch
+            else:
+                self.logger.warning(
+                    f"[DuckDBStorage] No candles available for {symbol} {timeframe}"
                 )
-
-                if not batch:
-                    self.logger.warning(
-                        f"[DuckDBStorage] No more candles available for "
-                        f"{symbol} {timeframe}"
-                    )
-                    break
-
-                all_candles.extend(batch)
-                remaining -= len(batch)
-
-                # If we got less than requested, we've hit the data limit
-                if len(batch) < fetch_count:
-                    break
 
             if not all_candles:
                 self.logger.error(

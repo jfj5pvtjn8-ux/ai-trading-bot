@@ -1,6 +1,8 @@
 """
 RestClient: Centralized REST API client for Binance with proper error handling,
 rate limiting, retry logic, and exponential backoff.
+
+Enhanced with robust pagination supporting 10,000+ candle fetching.
 """
 
 import time
@@ -21,6 +23,18 @@ class RestClient:
     - Proper error logging
     - Normalization of Binance kline format
     - open_ts-aligned timestamps for Liquidity Map compatibility
+    - Robust pagination supporting limit > 1000 (e.g., 10000 candles)
+    
+    Key Features:
+    - fetch_klines(symbol, timeframe, limit, start_time, end_time)
+      returns up to `limit` normalized candles (oldest -> newest)
+    - Automatic pagination for limit > 1000
+    - Order-independent window movement using raw Binance openTime
+    - Proper deduplication and alignment checks
+    
+    Normalized candle schema:
+        "open_ts" (seconds), "close_ts" (seconds), "ts" == open_ts,
+        "open", "high", "low", "close", "volume", plus extras
     """
 
     def __init__(self, app_config: AppConfig):
@@ -29,60 +43,42 @@ class RestClient:
 
         self.rest_endpoint = app_config.exchange.rest_endpoint
         self.request_timeout = app_config.exchange.request_timeout
-        self.max_retries = app_config.candles.initial_retries
-        self.retry_delay = app_config.candles.retry_delay
+        self.max_retries = max(1, int(getattr(app_config.candles, "initial_retries", 5)))
+        self.retry_delay = float(getattr(app_config.candles, "retry_delay", 1.0))
 
-        # Delay to avoid Binance API bans during pagination
-        self.per_request_delay = 0.1
+        # Delay between pagination requests to be polite (can be tuned)
+        self.per_request_delay = float(getattr(app_config.candles, "per_request_delay", 0.12))
 
-        # Session pooling
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": "Mozilla/5.0 (compatible; TradingBot/1.0)"
-            }
-        )
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; TradingBot/1.0)"})
 
-    # =========================================================================
-    # PUBLIC METHODS
-    # =========================================================================
-
+    # --------------------------
+    # Public
+    # --------------------------
     def fetch_klines(
         self,
         symbol: str,
         timeframe: str,
         limit: int = 500,
-        start_time: Optional[int] = None,
-        end_time: Optional[int] = None,
+        start_time: Optional[int] = None,  # milliseconds
+        end_time: Optional[int] = None,    # milliseconds
     ) -> List[Dict[str, Any]]:
         """
-        Fetch klines, auto-paginating if limit > 1000.
-        Returns fully normalized, deduped, aligned candles.
-
-        All returned candles use:
-          - open_ts (seconds, Binance kline[0] / 1000)
-          - close_ts (seconds, Binance kline[6] / 1000)
-          - ts == open_ts (master key used everywhere else)
+        Fetch klines, auto-paginating when limit > 1000.
+        Returns candles oldest -> newest (ts=open_ts in seconds).
+        `start_time` and `end_time` are milliseconds (Binance API).
+        If both None, this fetches most recent `limit` closed candles (uses current time ceiling).
         """
-        t0 = time.time()
-
         if limit <= 1000:
-            candles = self._fetch_single_batch(symbol, timeframe, limit, start_time, end_time)
-        else:
-            candles = self._fetch_with_pagination(symbol, timeframe, limit, start_time, end_time)
+            raw = self._fetch_single_batch(symbol, timeframe, limit, start_time, end_time)
+            return self._normalize_and_validate(raw, timeframe)
 
-        elapsed = time.time() - t0
-        self.logger.debug(
-            f"[RestClient] fetch_klines {symbol} {timeframe} "
-            f"limit={limit} -> {len(candles)} candles in {elapsed:.3f}s"
-        )
+        # pagination for >1000
+        return self._fetch_with_pagination(symbol, timeframe, limit, start_time, end_time)
 
-        return candles
-
-    # =========================================================================
-    # SINGLE-BATCH FETCH
-    # =========================================================================
-
+    # --------------------------
+    # Single batch
+    # --------------------------
     def _fetch_single_batch(
         self,
         symbol: str,
@@ -90,32 +86,22 @@ class RestClient:
         limit: int,
         start_time: Optional[int],
         end_time: Optional[int],
-    ) -> List[Dict[str, Any]]:
-
-        params: Dict[str, Any] = {
+    ) -> Optional[List[List[Any]]]:
+        params = {
             "symbol": symbol.upper(),
             "interval": timeframe,
-            "limit": min(limit, 1000),
+            "limit": max(1, min(limit, 1000)),
         }
-
         if start_time is not None:
-            params["startTime"] = start_time
+            params["startTime"] = int(start_time)
         if end_time is not None:
-            params["endTime"] = end_time
+            params["endTime"] = int(end_time)
 
-        raw = self._request_with_retry(params, context=f"{symbol} {timeframe}")
-        if not raw:
-            return []
+        return self._request_with_retry(params, context=f"{symbol} {timeframe}")
 
-        candles = self._normalize_klines(raw)
-        # Light alignment check for single batch
-        self._check_alignment(candles, timeframe)
-        return candles
-
-    # =========================================================================
-    # PAGINATION
-    # =========================================================================
-
+    # --------------------------
+    # Pagination
+    # --------------------------
     def _fetch_with_pagination(
         self,
         symbol: str,
@@ -124,25 +110,33 @@ class RestClient:
         start_time: Optional[int],
         end_time: Optional[int],
     ) -> List[Dict[str, Any]]:
+        """
+        Robust pagination:
+         - If end_time is provided (ms) we page *backwards* from end_time (most recent).
+         - Otherwise we page forwards starting at start_time if given, or
+           we compute an end_time = closed_ceiling and page backwards to get most recent candles.
+        Returns up to `limit` normalized candles (oldest -> newest).
+        """
+        tf_sec = self.app_config.get_timeframe_seconds(timeframe)
+        tf_ms = tf_sec * 1000
 
-        self.logger.info(
-            f"[RestClient] Paginated fetch: {limit} candles for {symbol} {timeframe}"
-        )
+        # If neither provided, set end_time to last fully closed candle (ms)
+        if start_time is None and end_time is None:
+            now = int(time.time())
+            closed_ceiling_open_ts = (now // tf_sec) * tf_sec  # seconds
+            end_time = closed_ceiling_open_ts * 1000
 
-        all_candles: List[Dict[str, Any]] = []
-        remaining = limit
-
-        # If end_time is provided, page backwards; else forwards
         direction_backwards = end_time is not None
+
+        all_raw: List[List[Any]] = []
+        remaining = limit
         next_start = start_time
         next_end = end_time
-
-        tf_ms = self.app_config.get_timeframe_seconds(timeframe) * 1000
 
         while remaining > 0:
             batch_limit = min(remaining, 1000)
 
-            batch = self._fetch_single_batch(
+            raw_batch = self._fetch_single_batch(
                 symbol=symbol,
                 timeframe=timeframe,
                 limit=batch_limit,
@@ -150,161 +144,134 @@ class RestClient:
                 end_time=next_end,
             )
 
-            if not batch:
+            if not raw_batch:
+                # nothing returned
                 break
 
-            all_candles.extend(batch)
-            remaining -= len(batch)
+            # append raw rows (we will dedupe & normalize later)
+            all_raw.extend(raw_batch)
+            remaining -= len(raw_batch)
 
-            if len(batch) < batch_limit:
-                # No more data from server
+            # if we received fewer than asked, server exhausted the range
+            if len(raw_batch) < batch_limit:
                 break
 
-            # --- Update pagination windows ---
+            # update pagination window
+            # convert raw_batch -> normalized open times to move window safely
+            # raw_batch items: [openTime_ms, open, high, low, close, volume, closeTime_ms, ...]
+            # find min and max openTime in this batch
+            try:
+                open_times_ms = [int(r[0]) for r in raw_batch]
+            except Exception:
+                # defensive: if parsing fails, stop to avoid infinite loop
+                break
+
+            min_open_ms = min(open_times_ms)
+            max_open_ms = max(open_times_ms)
+
             if direction_backwards:
-                # Move window backwards based on earliest candle open time
-                oldest_open_ms = batch[0]["open_ts"] * 1000
-                next_end = oldest_open_ms - 1
+                # move end backwards to just before the earliest open in this batch
+                next_end = min_open_ms - 1
             else:
-                # Move window forward based on latest candle open time
-                latest_open_ms = batch[-1]["open_ts"] * 1000
-                next_start = latest_open_ms + tf_ms
+                # move start forwards to just after the latest open in this batch
+                next_start = max_open_ms + 1
 
+            # small delay between paged requests
             time.sleep(self.per_request_delay)
 
-        # --- Deduplicate by master key (ts == open_ts) ---
-        unique = {c["ts"]: c for c in all_candles}
-        cleaned = list(unique.values())
+        # Normalize & dedupe by open_ts
+        normalized = self._normalize_klines(all_raw)
+        # Build unique by open_ts (ts)
+        unique_map = {c["open_ts"]: c for c in normalized}
+        cleaned = list(unique_map.values())
+        cleaned.sort(key=lambda x: x["open_ts"])
 
-        # --- Sort oldest → newest ---
-        cleaned.sort(key=lambda x: x["ts"])
+        # If we paged backwards to get most recent N, cleaned now contains all candidate candles oldest->newest.
+        # Return the last `limit` items (most recent N) to match expectation.
+        if len(cleaned) > limit:
+            cleaned = cleaned[-limit:]
 
-        # --- Validate alignment ---
+        # Final alignment check
         self._check_alignment(cleaned, timeframe)
 
-        return cleaned[:limit]
+        return cleaned
 
-    # =========================================================================
-    # EXACT CANDLE FETCH
-    # =========================================================================
-
-    def fetch_kline_exact(self, symbol: str, timeframe: str, open_ts: int):
+    # --------------------------
+    # Exact fetch
+    # --------------------------
+    def fetch_kline_exact(self, symbol: str, timeframe: str, open_ts: int) -> Optional[Dict[str, Any]]:
         """
-        Fetch exact candle by OPEN timestamp (seconds).
-
-        open_ts is the candle's open time in seconds (same as ts).
+        Fetch exact candle by open timestamp (seconds).
+        Returns normalized candle dict or None.
         """
         tf_sec = self.app_config.get_timeframe_seconds(timeframe)
         start_ms = open_ts * 1000
-        end_ms = (open_ts + tf_sec) * 1000
+        end_ms = (open_ts + tf_sec) * 1000 - 1
 
-        params = {
-            "symbol": symbol.upper(),
-            "interval": timeframe,
-            "startTime": start_ms,
-            "endTime": end_ms,
-            "limit": 2,
-        }
-
-        raw = self._request_with_retry(params, context=f"{symbol} {timeframe} open_ts={open_ts}")
+        raw = self._fetch_single_batch(symbol, timeframe, limit=2, start_time=start_ms, end_time=end_ms)
         if not raw:
             return None
 
-        candles = self._normalize_klines(raw)
-        for c in candles:
+        normalized = self._normalize_klines(raw)
+        for c in normalized:
             if c["open_ts"] == open_ts:
                 return c
-
         return None
 
-    # =========================================================================
-    # LOW LEVEL REQUEST + RETRY
-    # =========================================================================
-
-    def _request_with_retry(self, params: Dict[str, Any], context: str):
+    # --------------------------
+    # Request + Retry
+    # --------------------------
+    def _request_with_retry(self, params: Dict[str, Any], context: str) -> Optional[List[Any]]:
         url = self.rest_endpoint
-        backoff = self.retry_delay
+        backoff = float(self.retry_delay)
 
         for attempt in range(1, self.max_retries + 1):
-            start_attempt = time.time()
+            start_t = time.time()
             try:
-                resp = self.session.get(
-                    url,
-                    params=params,
-                    timeout=self.request_timeout,
-                )
-                duration = time.time() - start_attempt
+                resp = self.session.get(url, params=params, timeout=self.request_timeout)
+                duration = time.time() - start_t
 
-                # --- Rate limited (429) ---
                 if resp.status_code == 429:
-                    retry_after = float(resp.headers.get("Retry-After", backoff))
-                    wait = min(retry_after, backoff)
-                    self.logger.warning(
-                        f"[RestClient] 429 for {context}, sleeping {wait}s "
-                        f"(attempt {attempt}/{self.max_retries}, {duration:.3f}s)"
-                    )
+                    retry_after = resp.headers.get("Retry-After")
+                    wait = float(retry_after) if retry_after else backoff
+                    self.logger.warning(f"[RestClient] 429 for {context}, sleeping {wait}s (attempt {attempt})")
                     time.sleep(wait)
                     backoff *= 2
                     continue
 
-                # --- Server errors ---
-                if 500 <= resp.status_code < 600:
-                    self.logger.warning(
-                        f"[RestClient] Server error {resp.status_code} for {context}, "
-                        f"retrying... ({duration:.3f}s)"
-                    )
+                if resp.status_code >= 500:
+                    self.logger.warning(f"[RestClient] Server error {resp.status_code} for {context} (attempt {attempt})")
                     time.sleep(backoff)
                     backoff *= 2
                     continue
 
                 resp.raise_for_status()
                 data = resp.json()
-
                 if isinstance(data, list):
-                    self.logger.debug(
-                        f"[RestClient] OK {context}: {len(data)} rows in {duration:.3f}s"
-                    )
                     return data
-
-                self.logger.error(
-                    f"[RestClient] Unexpected response type {type(data)} for {context}"
-                )
+                self.logger.error(f"[RestClient] Unexpected response format for {context}: {type(data)}")
                 return None
 
             except requests.exceptions.Timeout:
-                duration = time.time() - start_attempt
-                self.logger.warning(
-                    f"[RestClient] Timeout for {context}, retrying... ({duration:.3f}s)"
-                )
+                self.logger.warning(f"[RestClient] Timeout for {context}, retrying (attempt {attempt})")
                 time.sleep(backoff)
                 backoff *= 2
 
             except requests.exceptions.ConnectionError as e:
-                duration = time.time() - start_attempt
-                self.logger.warning(
-                    f"[RestClient] Connection error for {context}: {e}, "
-                    f"retrying... ({duration:.3f}s)"
-                )
+                self.logger.warning(f"[RestClient] Connection error for {context}: {e}, retrying (attempt {attempt})")
                 time.sleep(backoff)
                 backoff *= 2
 
             except Exception as e:
-                duration = time.time() - start_attempt
-                self.logger.error(
-                    f"[RestClient] Fatal error for {context}: {e} "
-                    f"({duration:.3f}s)"
-                )
+                self.logger.error(f"[RestClient] Fatal error for {context}: {e}")
                 return None
 
-        self.logger.error(
-            f"[RestClient] FAILED after {self.max_retries} retries for {context}"
-        )
+        self.logger.error(f"[RestClient] Exhausted retries for {context}")
         return None
 
-    # =========================================================================
-    # NORMALIZATION (LM-READY)
-    # =========================================================================
-
+    # --------------------------
+    # Normalization & checks
+    # --------------------------
     def _normalize_klines(self, raw: List[List[Any]]) -> List[Dict[str, Any]]:
         """
         Normalize Binance /api/v3/klines response.
@@ -326,71 +293,62 @@ class RestClient:
         ]
         """
         candles: List[Dict[str, Any]] = []
-
+        
         for k in raw:
             try:
                 open_ms = int(k[0])
                 close_ms = int(k[6])
-
                 open_ts = open_ms // 1000
                 close_ts = close_ms // 1000
-
-                candles.append(
-                    {
-                        # MASTER TIME INDEX (open_ts) — safe for LM & CandleSync
-                        "open_ts": open_ts,
-                        "close_ts": close_ts,
-                        "ts": open_ts,  # alias used across pipeline
-
-                        "open": float(k[1]),
-                        "high": float(k[2]),
-                        "low": float(k[3]),
-                        "close": float(k[4]),
-                        "volume": float(k[5]),
-
-                        "quote_volume": float(k[7]),
-                        "trades": int(k[8]),
-                        "taker_buy_base": float(k[9]),
-                        "taker_buy_quote": float(k[10]),
-                    }
-                )
-
+                
+                candles.append({
+                    # MASTER TIME INDEX (open_ts) — safe for LM & CandleSync
+                    "open_ts": open_ts,
+                    "close_ts": close_ts,
+                    "ts": open_ts,  # alias used across pipeline
+                    
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                    "volume": float(k[5]),
+                    
+                    "quote_volume": float(k[7]) if len(k) > 7 else 0.0,
+                    "trades": int(k[8]) if len(k) > 8 else 0,
+                    "taker_buy_base": float(k[9]) if len(k) > 9 else 0.0,
+                    "taker_buy_quote": float(k[10]) if len(k) > 10 else 0.0,
+                })
             except Exception as e:
                 self.logger.error(f"[RestClient] Kline normalization error: {e}")
                 continue
-
+                
         return candles
 
-    # =========================================================================
-    # ALIGNMENT CHECK
-    # =========================================================================
+    def _normalize_and_validate(self, raw: Optional[List[List[Any]]], timeframe: str) -> List[Dict[str, Any]]:
+        if not raw:
+            return []
+        normalized = self._normalize_klines(raw)
+        self._check_alignment(normalized, timeframe)
+        # Ensure sorted oldest -> newest
+        normalized.sort(key=lambda x: x["open_ts"])
+        return normalized
 
-    def _check_alignment(self, candles: List[Dict[str, Any]], timeframe: str):
+    def _check_alignment(self, candles: List[Dict[str, Any]], timeframe: str) -> None:
         tf_sec = self.app_config.get_timeframe_seconds(timeframe)
         if not candles:
             return
-
         misaligned = 0
         for c in candles:
             if c["open_ts"] % tf_sec != 0:
                 misaligned += 1
-                self.logger.warning(
-                    f"[RestClient] Misaligned candle detected: "
-                    f"open_ts={c['open_ts']} ts={c['ts']} tf={timeframe}"
-                )
-
-        if misaligned > 0:
-            self.logger.warning(
-                f"[RestClient] Alignment check for {timeframe}: "
-                f"{misaligned}/{len(candles)} candles misaligned"
-            )
-
-    # =========================================================================
+                self.logger.warning(f"[RestClient] Misaligned candle detected: open_ts={c['open_ts']} tf={timeframe}")
+        if misaligned:
+            self.logger.warning(f"[RestClient] Alignment: {misaligned}/{len(candles)} misaligned for {timeframe}")
 
     def close(self):
         self.session.close()
         self.logger.debug("[RestClient] Session closed")
-
+    
     def __enter__(self):
         return self
 

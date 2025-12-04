@@ -19,7 +19,7 @@ candles:
 duckdb:
   enabled: true
   database_path: "data/trading.duckdb"
-  fresh_start: true
+  fresh_start: false
   max_gap_hours: 168
   initial_candles:
     1m: 10000

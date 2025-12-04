@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS market.candles (
     received_at    TIMESTAMP   DEFAULT now(),
 
     -- Optional partition helper
-    trading_day    DATE        DEFAULT date(from_unixtime(open_ts)),
+    trading_day    DATE,
 
     -- Constraints (DuckDB will enforce UNIQUE)
     CONSTRAINT candles_pk PRIMARY KEY (symbol, timeframe, open_ts)
