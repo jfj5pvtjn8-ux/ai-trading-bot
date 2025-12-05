@@ -218,6 +218,65 @@ class RestClient:
                 return c
         return None
 
+    def fetch_candles_between(self, symbol: str, timeframe: str, start_ts: int, end_ts: int) -> List[Dict[str, Any]]:
+        """
+        Fetch candles between start_ts and end_ts (exclusive).
+        Used for gap filling during WebSocket recovery.
+        Handles large gaps by fetching in multiple batches (1000 candles per request).
+        
+        Parameters:
+        ----------
+        start_ts: Start timestamp in seconds (exclusive - will fetch from start_ts + 1 interval)
+        end_ts: End timestamp in seconds (exclusive)
+        
+        Returns:
+        -------
+        List of normalized candles between the timestamps
+        """
+        tf_sec = self.app_config.get_timeframe_seconds(timeframe)
+        
+        # Calculate how many candles we need
+        gap_seconds = end_ts - start_ts
+        expected_candles = max(1, (gap_seconds + tf_sec - 1) // tf_sec)  # Ceiling division
+        
+        all_candles = []
+        current_start_ts = start_ts
+        
+        # Fetch in batches of 1000 (Binance API limit)
+        while current_start_ts < end_ts - tf_sec:
+            batch_start_ms = (current_start_ts + tf_sec) * 1000
+            batch_end_ms = (end_ts - 1) * 1000
+            
+            remaining_candles = (end_ts - current_start_ts) // tf_sec
+            batch_limit = min(int(remaining_candles), 1000)
+            
+            batch = self.fetch_klines(
+                symbol=symbol,
+                timeframe=timeframe,
+                limit=batch_limit,
+                start_time=batch_start_ms,
+                end_time=batch_end_ms
+            )
+            
+            if not batch:
+                break
+            
+            all_candles.extend(batch)
+            
+            # Move to the last candle's timestamp for next batch
+            current_start_ts = batch[-1]["ts"]
+            
+            # If we got less than requested, we've reached the end
+            if len(batch) < batch_limit:
+                break
+        
+        self.logger.info(
+            f"[RestClient] fetch_candles_between {symbol} {timeframe}: "
+            f"requested {expected_candles}, got {len(all_candles)} candles in {(len(all_candles) + 999) // 1000} batch(es)"
+        )
+        
+        return all_candles
+
     # --------------------------
     # Request + Retry
     # --------------------------

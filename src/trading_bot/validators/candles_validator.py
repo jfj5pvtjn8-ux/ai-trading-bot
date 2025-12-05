@@ -108,25 +108,73 @@ class CandlesValidator:
             '1d': 86400
         }
     
+    def _get_connection(self):
+        """Get a DuckDB connection (context manager)"""
+        return duckdb.connect(self.db_path, read_only=True)
+    
+    def remove_duplicates(self) -> int:
+        """
+        Remove duplicate candles from the database.
+        Keeps the first occurrence, deletes the rest.
+        
+        Returns:
+            Number of duplicate candles removed
+        """
+        removed_count = 0
+        
+        with duckdb.connect(self.db_path, read_only=False) as conn:
+            # Find and remove duplicates, keeping first occurrence
+            result = conn.execute("""
+                WITH ranked AS (
+                    SELECT 
+                        symbol, timeframe, open_ts,
+                        ROW_NUMBER() OVER (PARTITION BY symbol, timeframe, open_ts ORDER BY received_at) as rn
+                    FROM market.candles
+                )
+                DELETE FROM market.candles
+                WHERE (symbol, timeframe, open_ts) IN (
+                    SELECT symbol, timeframe, open_ts 
+                    FROM ranked 
+                    WHERE rn > 1
+                )
+            """).fetchall()
+            
+            # Get count of removed rows
+            removed_count = conn.execute("""
+                SELECT changes()
+            """).fetchone()[0]
+        
+        return removed_count
+    
     def validate_all(self, 
                      symbols: Optional[List[str]] = None,
-                     timeframes: Optional[List[str]] = None) -> ValidationReport:
+                     timeframes: Optional[List[str]] = None,
+                     conn: Optional[duckdb.DuckDBPyConnection] = None) -> ValidationReport:
         """
         Run all validations and generate comprehensive report
         
         Args:
             symbols: List of symbols to validate (None = all symbols)
             timeframes: List of timeframes to validate (None = all timeframes)
+            conn: Optional existing connection to use (avoids connection conflicts)
             
         Returns:
             ValidationReport with all issues found
         """
         issues = []
         
-        with duckdb.connect(self.db_path, read_only=True) as conn:
+        # Use provided connection or create new one
+        if conn is not None:
+            _conn = conn
+            should_close = False
+        else:
+            _conn = duckdb.connect(self.db_path, read_only=True)
+            should_close = True
+        
+        try:
             # Get symbols and timeframes if not specified
             if symbols is None or timeframes is None:
-                result = conn.execute("""
+                result = _conn.execute("""
                     SELECT DISTINCT symbol, timeframe 
                     FROM market.candles 
                     ORDER BY symbol, timeframe
@@ -138,15 +186,19 @@ class CandlesValidator:
                     timeframes = sorted(list(set(row[1] for row in result)))
             
             # Get total candle count
-            total_candles = conn.execute("SELECT COUNT(*) FROM market.candles").fetchone()[0]
+            total_candles = _conn.execute("SELECT COUNT(*) FROM market.candles").fetchone()[0]
             
             # Run all validation checks
-            issues.extend(self._check_duplicates(conn, symbols, timeframes))
-            issues.extend(self._check_misalignment(conn, symbols, timeframes))
-            issues.extend(self._check_gaps(conn, symbols, timeframes))
-            issues.extend(self._check_timestamp_validity(conn, symbols, timeframes))
-            issues.extend(self._check_null_values(conn, symbols, timeframes))
-            issues.extend(self._check_data_quality(conn, symbols, timeframes))
+            issues.extend(self._check_duplicates(_conn, symbols, timeframes))
+            issues.extend(self._check_misalignment(_conn, symbols, timeframes))
+            issues.extend(self._check_gaps(_conn, symbols, timeframes))
+            issues.extend(self._check_timestamp_validity(_conn, symbols, timeframes))
+            issues.extend(self._check_null_values(_conn, symbols, timeframes))
+            issues.extend(self._check_data_quality(_conn, symbols, timeframes))
+        finally:
+            # Only close if we created the connection
+            if should_close:
+                _conn.close()
         
         # Create summary
         summary = {
@@ -440,6 +492,72 @@ class CandlesValidator:
         
         return issues
     
+    def get_data_quality_score(self, report: ValidationReport) -> Dict[str, float]:
+        """
+        Calculate data quality score (0-100) based on validation results.
+        
+        Returns:
+            Dictionary with overall score and per-category scores
+        """
+        if report.total_candles == 0:
+            return {'overall': 100.0}
+        
+        # Weight different issue types
+        weights = {
+            'duplicate': 10.0,      # Very serious
+            'invalid_data': 10.0,   # Very serious
+            'null_value': 10.0,     # Very serious
+            'invalid_timestamp': 5.0,
+            'gap': 2.0,
+            'misaligned': 1.0
+        }
+        
+        # Calculate penalty points
+        total_penalty = 0.0
+        category_scores = {}
+        
+        for issue_type, weight in weights.items():
+            count = report.summary.get(issue_type, 0)
+            if count > 0:
+                # Penalty = (count / total_candles) * weight * severity_multiplier
+                critical_count = len([i for i in report.issues if i.issue_type == issue_type and i.severity == 'critical'])
+                severity_multiplier = 2.0 if critical_count > count / 2 else 1.0
+                penalty = (count / report.total_candles) * weight * severity_multiplier * 100
+                total_penalty += min(penalty, 20.0)  # Cap per-type penalty at 20
+                
+                # Calculate category score
+                category_scores[issue_type] = max(0.0, 100.0 - penalty)
+            else:
+                category_scores[issue_type] = 100.0
+        
+        # Overall score
+        overall_score = max(0.0, 100.0 - total_penalty)
+        
+        return {
+            'overall': round(overall_score, 2),
+            'categories': category_scores,
+            'grade': self._get_grade(overall_score)
+        }
+    
+    def _get_grade(self, score: float) -> str:
+        """Get letter grade for data quality score"""
+        if score >= 95:
+            return 'A+'
+        elif score >= 90:
+            return 'A'
+        elif score >= 85:
+            return 'B+'
+        elif score >= 80:
+            return 'B'
+        elif score >= 75:
+            return 'C+'
+        elif score >= 70:
+            return 'C'
+        elif score >= 60:
+            return 'D'
+        else:
+            return 'F'
+    
     def get_detailed_report(self, report: ValidationReport) -> str:
         """
         Generate a detailed text report with all issues
@@ -528,6 +646,18 @@ if __name__ == '__main__':
         
         # Run all validations
         report = validator.validate_all()
+        
+        # Calculate and display data quality score
+        quality_score = validator.get_data_quality_score(report)
+        print('\n' + '='*100)
+        print('DATA QUALITY SCORE')
+        print('='*100)
+        print(f"Overall Score: {quality_score['overall']}/100 (Grade: {quality_score['grade']})")
+        print('\nCategory Scores:')
+        for category, score in quality_score.get('categories', {}).items():
+            status = '✅' if score >= 90 else '⚠️' if score >= 70 else '❌'
+            print(f"  {status} {category.replace('_', ' ').title()}: {score:.1f}/100")
+        print('='*100)
         
         # Print summary
         report.print_summary()

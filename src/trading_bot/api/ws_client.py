@@ -51,6 +51,13 @@ class WebSocketClient:
         # Heartbeat monitoring
         self.last_message_ts = 0
         self.heartbeat_interval = 30  # warning if no messages for 30s
+        self.last_ping_ts = 0
+        self.connection_stale_threshold = 60  # proactive reconnect after 60s of no data
+        
+        # Connection health tracking
+        self.successful_connections = 0
+        self.failed_connections = 0
+        self.last_disconnect_ts = 0
 
     # -------------------------------------------------------------------------
     # PUBLIC API
@@ -148,10 +155,17 @@ class WebSocketClient:
     # -------------------------------------------------------------------------
 
     def _run_forever(self):
-        """Handles reconnection logic."""
+        """Handles reconnection logic with improved ping/pong settings."""
         while self.is_running:
             try:
-                self.ws.run_forever(ping_interval=20, ping_timeout=10)
+                # More aggressive ping/pong to detect stale connections faster
+                # ping_interval=15: send ping every 15 seconds
+                # ping_timeout=10: wait 10 seconds for pong before declaring dead
+                self.ws.run_forever(
+                    ping_interval=15,
+                    ping_timeout=10,
+                    skip_utf8_validation=True  # Performance optimization
+                )
                 if self.is_running:
                     self._handle_reconnect()
             except Exception as e:
@@ -162,11 +176,33 @@ class WebSocketClient:
         self.is_connected = True
         self.reconnect_attempts = 0
         self.last_message_ts = time.time()
-        self.logger.info("[WebSocket] Connected.")
+        self.last_ping_ts = time.time()
+        self.successful_connections += 1
+        
+        # Calculate connection quality
+        total_connections = self.successful_connections + self.failed_connections
+        if total_connections > 0:
+            quality = (self.successful_connections / total_connections) * 100
+            self.logger.info(
+                f"[WebSocket] Connected. Quality: {quality:.1f}% "
+                f"(success={self.successful_connections}, fail={self.failed_connections})"
+            )
+        else:
+            self.logger.info("[WebSocket] Connected.")
 
     def _on_close(self, ws, code, reason):
         self.is_connected = False
-        self.logger.warning(f"[WebSocket] Closed → code={code}, reason={reason}")
+        self.last_disconnect_ts = time.time()
+        self.failed_connections += 1
+        
+        # Only log WARNING if this is a repeated failure
+        if self.failed_connections > 3:
+            self.logger.warning(
+                f"[WebSocket] Closed → code={code}, reason={reason} "
+                f"(consecutive failures: {self.failed_connections})"
+            )
+        else:
+            self.logger.info(f"[WebSocket] Closed → code={code}, reason={reason}")
 
     def _on_error(self, ws, error):
         self.logger.error(f"[WebSocket] Error: {error}")
@@ -203,6 +239,14 @@ class WebSocketClient:
             candle = self._normalize_kline(k)
             if not candle:
                 return
+
+            # Log received closed candle
+            symbol = k.get("s", "UNKNOWN")
+            interval = k.get("i", "UNKNOWN")
+            self.logger.info(
+                f"[WebSocket] ✓ Received closed candle: {symbol} {interval} "
+                f"(ts={candle['ts']}, close={candle['close']:.8f})"
+            )
 
             cb = self.callbacks.get(stream)
             if cb:
@@ -278,12 +322,27 @@ class WebSocketClient:
     # -------------------------------------------------------------------------
 
     def _heartbeat_monitor(self):
-        """Warns if no WebSocket messages received for heartbeat_interval seconds."""
+        """Monitors connection health and proactively reconnects if stale."""
         while self.is_running:
             time.sleep(self.heartbeat_interval)
+            
             if self.is_connected:
                 delta = time.time() - self.last_message_ts
-                if delta > self.heartbeat_interval:
+                
+                # PROACTIVE RECONNECTION: If no data for threshold, force reconnect
+                if delta > self.connection_stale_threshold:
+                    self.logger.warning(
+                        f"[WebSocket] Connection stale ({int(delta)}s without data). "
+                        f"Forcing proactive reconnection..."
+                    )
+                    try:
+                        self.ws.close()
+                    except Exception:
+                        pass
+                    self.failed_connections = 0  # Reset counter for proactive reconnect
+                    
+                # Regular heartbeat warning
+                elif delta > self.heartbeat_interval:
                     self.logger.warning(
                         f"[WebSocket] Heartbeat stalled ({int(delta)}s without data)"
                     )
